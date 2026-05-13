@@ -169,6 +169,7 @@ def test_strip_preserves_value_semantics() -> None:
     assert out["Authorization"] == "Bearer sk-ant-..."
     assert out["anthropic-version"] == "2023-06-01"
 
+
 def test_strip_default_tenant_header_removed() -> None:
     """Tenant header is ingress-only and must not reach providers."""
     out = _strip_internal_headers(
@@ -180,6 +181,7 @@ def test_strip_default_tenant_header_removed() -> None:
 
     assert "X-Headroom-Tenant-ID" not in out
     assert out["Authorization"] == "Bearer sk-ant-..."
+
 
 def test_strip_custom_tenant_header_removed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Configured tenant header is also stripped, even outside x-headroom-*."""

@@ -1376,8 +1376,7 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
         k: v
         for k, v in headers.items()
-        if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)
-        and k.lower() != tenant_header_lower
+        if not k.lower().startswith(_INTERNAL_HEADER_PREFIX) and k.lower() != tenant_header_lower
     }
 
 

@@ -80,6 +80,7 @@ def test_compression_executor_minimum_one_worker() -> None:
     proxy = _make_proxy(compression_max_workers=0)
     assert proxy.compression_max_workers == 1
 
+
 def test_compression_executor_preserves_request_contextvars() -> None:
     """Tenant context survives the thread-pool hop used by compression."""
     proxy = _make_proxy(compression_max_workers=1)

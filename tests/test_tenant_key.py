@@ -85,7 +85,6 @@ def test_header_path_falls_through_when_empty_after_sanitization() -> None:
 # ── Hash path ─────────────────────────────────────────────────────────
 
 
-
 def test_bearer_without_header_uses_global_namespace() -> None:
     req = _request(
         headers={"authorization": "Bearer sk-ant-api03-abc123def"},
@@ -106,6 +105,7 @@ def test_auth_mode_without_header_does_not_partition_tenants() -> None:
 
     assert payg == (GLOBAL_TENANT_KEY, SOURCE_GLOBAL)
     assert oauth == (GLOBAL_TENANT_KEY, SOURCE_GLOBAL)
+
 
 def test_global_fallback_when_no_signals() -> None:
     """No header, no auth, no key ⇒ literal ``"global"``."""

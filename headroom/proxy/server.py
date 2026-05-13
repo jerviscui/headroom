@@ -26,8 +26,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
-import contextvars
 import contextlib
+import contextvars
 import json
 import logging
 import os
