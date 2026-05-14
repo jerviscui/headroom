@@ -26,8 +26,13 @@
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
-  <a href="https://discord.gg/yRmaUNpsPJ">Discord</a>
+  <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
+  <a href="llms.txt">llms.txt</a>
 </p>
+
+<p align="center"><sub>
+  <b>AI agents / LLMs:</b> read <a href="llms.txt"><code>/llms.txt</code></a> here, or fetch <a href="https://headroom-docs.vercel.app/llms.txt">the live index</a> / <a href="https://headroom-docs.vercel.app/llms-full.txt">full docs blob</a>.
+</sub></p>
 
 ---
 
