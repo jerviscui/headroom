@@ -113,6 +113,27 @@ from headroom.transforms.compression_policy import resolve_policy
 logger = logging.getLogger("headroom.engine")
 
 
+class EngineResponsesMemoryUnsupportedError(RuntimeError):
+    """Raised by the engine's /v1/responses path when memory injection WOULD apply.
+
+    The live ``handle_openai_responses`` handler injects memory context into
+    ``body["input"]`` AND sticky memory tools into ``body["tools"]`` BEFORE
+    compression (``handlers/openai.py`` ~L2876; see the explicit comment at
+    ~L2858 confirming the responses path "injects BEFORE compression today",
+    unlike the chat path which injects after). The engine's responses path does
+    not yet reproduce that.
+
+    Silently forwarding memory-less bytes is NOT an option: the shadow cannot
+    catch the gap (the parity corpus runs with memory off), so in a flipped
+    (``on``) deployment it would drop the user's memory context and bust the
+    prompt cache. Instead the engine refuses LOUDLY — the handler's ``on``-mode
+    fallback then forwards the proven legacy bytes (``engine_on_fallback_total``)
+    and ``shadow`` records ``engine_shadow_error_total``. Full faithful wiring
+    (context + sticky tools, before compression, with memory-on parity fixtures)
+    is a queued follow-up.
+    """
+
+
 class AnthropicComponents:
     """Real Anthropic compression components for the engine.
 
@@ -1358,16 +1379,24 @@ class HeadroomEngine:
         compression, hooks — all off in the golden corpus's
         ``_DEFAULT_CONFIG_KWARGS``.
 
-        Memory / CCR for Responses (intentionally deferred):
-        The live ``handle_openai_responses`` handler runs memory injection
-        into ``body["input"]`` BEFORE compression, using
-        ``append_text_to_latest_user_input_item``.  Wiring it here would
-        require restructuring the engine to expose ``body["input"]`` after
-        the ``_compress_openai_responses_payload`` step (the compressor
-        already returns the mutated body dict).  This is deferred; when
-        wired it should run AFTER compression (mirrors the chat path) and
-        use the same ``append_text_to_latest_user_input_item`` helper.
-        The 6 golden Responses fixtures are not affected (memory/CCR off).
+        Memory / CCR for Responses (NOT yet wired — guarded loud, FIX #3):
+        The live ``handle_openai_responses`` handler injects memory context
+        into ``body["input"]`` AND sticky memory tools into ``body["tools"]``
+        BEFORE compression (handler ~L2876; the comment at ~L2858 confirms the
+        responses path "injects BEFORE compression today", unlike the chat
+        path which injects after).  The engine does not yet reproduce this.
+
+        Because the shadow CANNOT catch the gap (the parity corpus runs memory
+        off), silently forwarding memory-less bytes in a flipped deployment
+        would drop the user's memory context and bust the prompt cache.  So
+        this path RAISES ``EngineResponsesMemoryUnsupportedError`` when memory
+        would inject (gate mirrors the chat path + ``MemoryDecision``); the
+        handler's ``on``-mode fallback then forwards legacy bytes and
+        ``shadow`` records an error.  Full faithful wiring (context + sticky
+        tools, before compression, with memory-on parity fixtures) is queued.
+        The 6 golden Responses fixtures are unaffected (memory/CCR off →
+        ``MemoryComponents.memory_handler`` is None → guard does not fire).
+        CCR for responses remains deferred separately.
         """
         from headroom.proxy.helpers import serialize_body_canonical
 
@@ -1391,6 +1420,34 @@ class HeadroomEngine:
             headers.get("x-headroom-bypass", "").strip().lower() == "true"
             or headers.get("x-headroom-mode", "").strip().lower() == "passthrough"
         )
+
+        # ── Memory fail-safe guard (FIX #3) ──────────────────────────────────
+        # The live responses handler injects memory (context into body["input"]
+        # + sticky tools into body["tools"]) BEFORE compression. The engine does
+        # not yet reproduce that, and the shadow CANNOT catch the gap (the parity
+        # corpus runs memory off). Forwarding memory-less bytes in a flipped
+        # deployment would silently drop the user's memory context and bust the
+        # prompt cache — so when memory WOULD inject, refuse LOUDLY. The handler's
+        # `on`-mode fallback then forwards legacy bytes (correct); `shadow` logs
+        # an error. Gate mirrors the engine's chat memory path + MemoryDecision.
+        mc = self._memory_components
+        if mc is not None and not _bypass and mc.memory_handler is not None:
+            from headroom.proxy.helpers import get_memory_injection_mode
+            from headroom.proxy.memory_decision import MemoryDecision
+
+            _mem_user_id = headers.get("x-headroom-user-id") or mc.default_user_id
+            _mem_decision = MemoryDecision.decide(
+                headers=ctx.headers_view,
+                memory_handler=mc.memory_handler,
+                memory_user_id=_mem_user_id,
+                mode_name=get_memory_injection_mode(),
+            )
+            if _mem_decision.inject:
+                raise EngineResponsesMemoryUnsupportedError(
+                    "engine /v1/responses cannot yet reproduce the handler's "
+                    "pre-compression memory injection (context + sticky tools); "
+                    "refusing so the legacy path handles this request"
+                )
 
         # Compression gate: ``config.optimize and not _bypass``.
         # The responses handler does NOT call CompressionDecision.decide;
