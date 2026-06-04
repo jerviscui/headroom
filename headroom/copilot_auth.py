@@ -474,31 +474,27 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
 
 
 def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
-    """Return the Copilot API endpoint advertised for the current OAuth token.
+    """Return the Copilot API host to route wrapped requests through.
 
-    An explicit ``GITHUB_COPILOT_API_URL`` always wins — it is the operator's
-    escape hatch (corporate proxy, pinning the generic host, tests). Honoring it
-    *before* the user-info lookup was lost in 0.23.0, which silently forced every
-    request onto the account-specific ``endpoints.api`` host (see #610).
+    Resolution order:
+
+    1. An explicit ``GITHUB_COPILOT_API_URL`` — the operator's escape hatch
+       (corporate proxy, enterprise / data-residency host, tests).
+    2. The generic public host ``https://api.githubcopilot.com``.
+
+    The account-specific ``endpoints.api`` advertised by ``/copilot_internal/user``
+    is intentionally NOT used to route. It returns a segmented host (e.g.
+    ``api.individual.githubcopilot.com``) that does not serve newer models on the
+    responses API — wrapping such a request regressed after 0.22.4 (#610) — and it
+    is not the host the official Copilot client routes with (that comes from the
+    token-exchange endpoint, not user info). Accounts that genuinely require a
+    dedicated host set ``GITHUB_COPILOT_API_URL`` explicitly. ``oauth_token`` is
+    accepted for call-site compatibility but no longer triggers a network lookup.
     """
 
+    del oauth_token  # reserved; routing no longer depends on a user-info lookup
     override = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
-    if override:
-        return override
-
-    token = (oauth_token or read_cached_oauth_token() or "").strip()
-    if not token:
-        return DEFAULT_API_URL
-
-    payload = _fetch_copilot_user_info(token)
-    if payload is None:
-        return DEFAULT_API_URL
-
-    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
-    api_url = endpoints.get("api") if isinstance(endpoints, dict) else None
-    if isinstance(api_url, str) and api_url.strip():
-        return api_url.strip()
-    return DEFAULT_API_URL
+    return override or DEFAULT_API_URL
 
 
 def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:

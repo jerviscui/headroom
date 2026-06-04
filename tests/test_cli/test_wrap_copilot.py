@@ -623,14 +623,15 @@ def test_wrap_copilot_byok_never_resolves_copilot_endpoint(
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
 
 
-def test_wrap_copilot_subscription_uses_account_specific_endpoint(
+def test_wrap_copilot_subscription_uses_generic_endpoint_not_account(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--subscription is the genuinely new 0.23 path: it resolves the
-    account-specific endpoint advertised by user-info (needed for business /
-    enterprise plans), and remains overridable via GITHUB_COPILOT_API_URL."""
+    """#610 (subscription has the same latent bug): --subscription must route to
+    the generic host too, even when /copilot_internal/user advertises an
+    account-specific host. The segmented host does not serve newer models on the
+    responses API, and it is not the host the official Copilot client uses."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
     captured: dict[str, object] = {}
@@ -653,21 +654,55 @@ def test_wrap_copilot_subscription_uses_account_specific_endpoint(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert captured["openai_api_url"] == "https://api.individual.githubcopilot.com"
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-sub"
 
 
-def test_resolve_copilot_api_url_override_wins_over_user_info(
+def test_wrap_copilot_subscription_honors_api_url_override(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unit-level lock for #610: an explicit GITHUB_COPILOT_API_URL must win even
-    when a token resolves and /copilot_internal/user advertises a different host.
-    Before the fix the override was only consulted when user-info *failed*."""
+    """Enterprise / data-residency accounts that require a dedicated host pin it
+    via GITHUB_COPILOT_API_URL — the override must flow through --subscription."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.enterprise.example.com")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-sub"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == "https://api.enterprise.example.com"
+
+
+def test_resolve_copilot_api_url_ignores_user_info_and_never_calls_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unit lock for #610: routing is override -> generic and must NOT depend on a
+    user-info lookup. Even with a token in hand and user-info advertising an
+    account host, the generic host is returned and no network call is made."""
     from headroom import copilot_auth
 
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
+        assert copilot_auth.resolve_copilot_api_url("gho-real") == copilot_auth.DEFAULT_API_URL
+    fetch.assert_not_called()
+
     monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://pin.example.com")
-    with patch.object(
-        copilot_auth, "_fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO
-    ) as fetch:
+    with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
         assert copilot_auth.resolve_copilot_api_url("gho-real") == "https://pin.example.com"
     fetch.assert_not_called()
