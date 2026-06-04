@@ -117,7 +117,9 @@ def _get_parser(language: str) -> Any:
             from tree_sitter_language_pack import get_language
 
             parser = Parser()
-            parser.language = get_language(language)
+            # `language` is a validated runtime str; get_language types its arg
+            # as a Literal of supported names, which a dynamic str can't satisfy.
+            parser.language = get_language(language)  # type: ignore[arg-type]
             parsers[language] = parser
             logger.debug(
                 "Loaded tree-sitter parser for %s (thread %s)",
@@ -163,7 +165,9 @@ def unload_tree_sitter() -> bool:
     if parsers:
         count = len(parsers)
         parsers.clear()
-        logger.info("Unloaded %d tree-sitter parsers (thread %s)", count, threading.current_thread().name)
+        logger.info(
+            "Unloaded %d tree-sitter parsers (thread %s)", count, threading.current_thread().name
+        )
         return True
     return False
 
