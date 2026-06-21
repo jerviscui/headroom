@@ -1376,7 +1376,10 @@ class HeadroomProxy(
                 "Opt out: HEADROOM_TELEMETRY=off or --no-telemetry"
             )
         else:
-            logger.info("Anonymous telemetry: DISABLED")
+            logger.info(
+                "Anonymous telemetry: DISABLED (off by default — opt in: "
+                "HEADROOM_TELEMETRY=on or --telemetry)"
+            )
 
         self.pipeline_extensions.emit(
             PipelineStage.POST_START,

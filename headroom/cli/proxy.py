@@ -599,9 +599,14 @@ def _selected_context_tool() -> str:
     ),
 )
 @click.option(
+    "--telemetry",
+    is_flag=True,
+    help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
+)
+@click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Disable anonymous usage telemetry (env: HEADROOM_TELEMETRY=off)",
+    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -686,6 +691,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
     embedding_server: bool,
@@ -783,7 +789,10 @@ def proxy(
         "on",
     )
 
-    # Telemetry opt-out: --no-telemetry flag sets the env var
+    # Telemetry is opt-in (off by default). --telemetry opts in; --no-telemetry
+    # forces it off. If both are passed, the explicit opt-out wins (fail-closed).
+    if telemetry:
+        os.environ["HEADROOM_TELEMETRY"] = "on"
     if no_telemetry:
         os.environ["HEADROOM_TELEMETRY"] = "off"
 
@@ -993,14 +1002,17 @@ Memory (Multi-Provider):
 
     from headroom.telemetry.beacon import is_telemetry_enabled
 
-    # Build telemetry section for the startup banner
+    # Build telemetry section for the startup banner. Telemetry is opt-in
+    # (off by default); the disabled line surfaces how to opt in.
     if is_telemetry_enabled():
         telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats)\n"
+            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
             "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
         )
     else:
-        telemetry_line = "  Telemetry:    DISABLED"
+        telemetry_line = (
+            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+        )
 
     # Discover proxy extensions (third-party packages registered via the
     # `headroom.proxy_extension` entry-point group). Surfaced in the banner
