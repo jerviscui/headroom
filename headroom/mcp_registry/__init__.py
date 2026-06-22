@@ -17,6 +17,7 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
+from .opencode import OpencodeRegistrar
 from .install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,
@@ -30,6 +31,7 @@ __all__ = [
     "ClaudeRegistrar",
     "CodexRegistrar",
     "MCPRegistrar",
+    "OpencodeRegistrar",
     "RegisterResult",
     "RegisterStatus",
     "ServerSpec",
