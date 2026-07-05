@@ -881,6 +881,14 @@ class ContentRouterConfig:
     # references the earlier block's kompressed-but-CCR-recoverable form
     # (deterministic content-hash → stable → still cache-safe, no added loss).
     enable_cross_turn_dedup: bool = False
+    # A7: lossless-then-lossy. In lossy mode (not `lossless`), after a byte/data
+    # lossless fold (search/log/text) run the aggressive lossy compressor
+    # (Kompress) on the FOLDED remainder and keep it iff it removes a further
+    # meaningful chunk — recovering the semantic word-drop that plain lossless
+    # leaves on the table while never doing worse than the fold. DIFF folds are
+    # never lossy-chained (Kompressing hunks breaks `git apply`). No-op in
+    # lossless-only mode. Env: HEADROOM_LOSSLESS_THEN_LOSSY=1.
+    lossless_then_lossy: bool = False
     min_section_tokens: int = 20  # Min tokens to compress a section
 
     # Fallback: Kompress handles unknown/mixed content instead of passing through
@@ -1258,6 +1266,13 @@ class ContentRouter(Transform):
         }
     )
 
+    # A7 (lossless-then-lossy): the lossy pass replaces the byte-exact fold only
+    # if it removes a further meaningful chunk — Kompress output must be <= this
+    # fraction of the fold's tokens (i.e. >= 10% additional reduction). Below
+    # that the marginal lossy gain isn't worth the accuracy cost when a lossless
+    # fold is already in hand, so the pure fold is kept.
+    _A7_MIN_LOSSY_GAIN = 0.90
+
     def __init__(
         self,
         config: ContentRouterConfig | None = None,
@@ -1330,6 +1345,13 @@ class ContentRouter(Transform):
         self._cross_turn_dedup_enabled: bool = (
             self.config.enable_cross_turn_dedup
             or os.environ.get("HEADROOM_DEDUPE", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # A7: lossless-then-lossy. Config field OR env HEADROOM_LOSSLESS_THEN_LOSSY.
+        # Only takes effect in lossy mode (STAGE 0 guards on `not config.lossless`).
+        self._lossless_then_lossy: bool = (
+            self.config.lossless_then_lossy
+            or os.environ.get("HEADROOM_LOSSLESS_THEN_LOSSY", "").strip().lower()
             in ("1", "true", "yes", "on")
         )
 
@@ -1804,6 +1826,23 @@ class ContentRouter(Transform):
                 best, best_label = cand, f"lossless_{kind}"
         return best, best_label
 
+    @staticmethod
+    def _looks_like_diff(content: str) -> bool:
+        """Cheap structural sniff for unified/git-diff content.
+
+        Used to keep A7's lossy pass (Kompress) OFF diff content — Kompressing
+        hunks corrupts ``git apply``. This is defense-in-depth beyond the
+        DIFF-strategy and ``lossless_diff``-label checks: a diff can be folded
+        best under a non-diff label (e.g. blank-line collapse → ``lossless_text``)
+        or mis-detected, and must still never reach the lossy stage.
+        """
+        return (
+            "diff --git " in content
+            or "\n@@ " in content
+            or content.startswith("@@ ")
+            or content.startswith("--- ")
+        )
+
     def _has_lossless_fold(self, content: str) -> bool:
         """True if a byte/data-lossless fold shrinks ``content`` (any format).
 
@@ -1865,11 +1904,48 @@ class ContentRouter(Transform):
         _ll_content, _ll_label = self._lossless_first(content, strategy)
         if _ll_label is not None:
             # A byte/data-lossless fold exists. It is fully recoverable and
-            # MARKER-FREE (zero-turn), so it is the answer for this block in BOTH
-            # modes: lossless-only obviously stops here, and in CCR mode we still
-            # prefer the marker-free fold over a lossy drop for the foldable
-            # formats (search/log/diff). Returning it directly also guarantees
-            # the fold is never discarded by a lossy stage that fails the gate.
+            # MARKER-FREE (zero-turn), so by default it is the answer for this
+            # block in BOTH modes: lossless-only obviously stops here, and in CCR
+            # mode we still prefer the marker-free fold over a lossy drop for the
+            # foldable formats (search/log/diff). Returning it directly also
+            # guarantees the fold is never discarded by a lossy stage that fails
+            # the gate.
+            #
+            # A7 (lossless-then-lossy, lossy mode only): don't stop at the fold —
+            # run the aggressive lossy compressor (Kompress) on the byte-folded
+            # remainder and keep it IFF it removes a further meaningful chunk
+            # (Kompress tokens <= _A7_MIN_LOSSY_GAIN * fold tokens). This keeps
+            # the byte-fold AND reclaims the semantic word-drop tail while never
+            # doing worse than the fold (on no/marginal lossy gain we return the
+            # pure fold). DIFF folds are always returned verbatim — Kompressing
+            # hunks corrupts `git apply`.
+            _a7 = (
+                self._lossless_then_lossy
+                and not self.config.lossless
+                and strategy != CompressionStrategy.DIFF
+                and _ll_label != "lossless_diff"
+                and not self._looks_like_diff(content)
+            )
+            if _a7:
+                _fold_tokens = len(_ll_content.split())
+                try:
+                    _komp, _komp_tokens = self._try_ml_compressor(
+                        _ll_content, context, question
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("A7 lossy-after-fold failed: %s", exc)
+                    _komp, _komp_tokens = None, None
+                if (
+                    _komp is not None
+                    and _komp_tokens <= _fold_tokens * self._A7_MIN_LOSSY_GAIN
+                    and len(_komp) < len(_ll_content)
+                ):
+                    return (
+                        _komp,
+                        _komp_tokens,
+                        [_ll_label, CompressionStrategy.KOMPRESS.value],
+                    )
+                return _ll_content, _fold_tokens, [_ll_label]
             return _ll_content, len(_ll_content.split()), [_ll_label]
         if self.config.lossless:
             # Lossless-only mode (HEADROOM_LOSSLESS=1, no CCR) and nothing
@@ -4186,30 +4262,45 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-        # Lossless-fold acceptance (byte-measured): a byte/data-lossless fold
+        # Lossless-anchored acceptance (byte-measured): a byte/data-lossless fold
         # (search --heading, log run-collapse) has ZERO accuracy cost, so it must
         # never be rejected by the WORD-ratio gate below — heading/indent folds
         # cut tokens while word count stays flat or even rises. Accept on a real
         # BYTE reduction (there is no tokenizer in scope here; byte length is a
         # faithful token proxy for these folds) and store a byte-based ratio so
-        # the Tier-2 result cache reuses it on later turns. Only lossless-labeled
-        # (recoverable) folds take this path, so the lossy-unmarked reversibility
-        # guard below is intentionally not reached for them.
+        # the Tier-2 result cache reuses it on later turns.
+        #
+        # Two shapes take this path:
+        #   • Pure fold  (chain == [lossless_*])           — byte-exact, always safe.
+        #   • A7 fold+lossy (chain == [lossless_*, kompress]) — accepted on bytes
+        #     ONLY in no-CCR mode (config.ccr_inject_marker=False), where unmarked
+        #     lossy is the deliberate output. The byte-exact fold is the floor, so
+        #     the block is guaranteed to shrink and never falls below the fold.
+        # A pure fold bypasses the lossy-unmarked reversibility guard (it is
+        # recoverable); the A7 lossy-tail case only reaches here when markers are
+        # off, where that guard is a no-op anyway.
         _chain = getattr(result, "strategy_chain", None) or []
-        _is_pure_lossless = bool(_chain) and all(
+        _starts_lossless = bool(_chain) and _chain[0].startswith("lossless_")
+        _is_pure_lossless = _starts_lossless and all(
             s.startswith("lossless_") for s in _chain
         )
-        _ll_label = _chain[0] if _is_pure_lossless else None
-        if _ll_label is not None and len(result.compressed) < len(content):
+        _byte_accept = _starts_lossless and (
+            _is_pure_lossless or not self.config.ccr_inject_marker
+        )
+        if _byte_accept and len(result.compressed) < len(content):
             _ll_ratio = len(result.compressed) / max(1, len(content))
+            _ll_label = _chain[0] if _is_pure_lossless else "+".join(_chain)
             self._cache.put(content_key, result.compressed, _ll_ratio, _ll_label)
             transforms_applied.append(f"router:{strategy_label}:{_ll_label}")
             if compressed_details is not None:
                 compressed_details.append(f"{details_prefix}:{_ll_label}:{_ll_ratio:.2f}")
             if route_counts is not None:
-                route_counts["lossless_accept"] = (
-                    route_counts.get("lossless_accept", 0) + 1
+                _bucket = (
+                    "lossless_accept"
+                    if _is_pure_lossless
+                    else "lossless_then_lossy_accept"
                 )
+                route_counts[_bucket] = route_counts.get(_bucket, 0) + 1
             return result.compressed, True
         if result.compression_ratio < min_ratio:
             # Tool ground truth must stay reversible: a lossy summarizer
