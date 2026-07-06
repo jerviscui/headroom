@@ -65,7 +65,7 @@ def test_cache_safety_prefix_monotonic():
 
 
 def test_below_min_lines_not_folded():
-    span = _code("", 3)  # < 6 lines
+    span = _code("", 3)  # below min_lines (7)
     blocks = [_blk(span, 1), _blk(span, 2)]
     out, stats = dedup_blocks(blocks)
     assert stats["spans_folded"] == 0

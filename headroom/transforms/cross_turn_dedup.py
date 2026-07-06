@@ -33,8 +33,10 @@ from dataclasses import dataclass
 __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 
 # A run must be at least this many lines AND this many chars to be worth a
-# pointer. Small dups are left alone (fragmenting context is not worth it).
-DEFAULT_MIN_LINES = 6
+# pointer. Small dups are left alone (fragmenting context is not worth it) —
+# and a larger floor keeps the pointer comfortably shorter than the span it
+# replaces, so a fold is always a net byte win.
+DEFAULT_MIN_LINES = 7
 DEFAULT_MIN_CHARS = 120
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
 # can't blow up matching. Deterministic: candidates are kept in first-seen order.
