@@ -8,6 +8,7 @@ verbatim (no lossy drop). In CCR mode (flag off) a foldable block still keeps
 its byte-exact fold — the lossless floor is never discarded by a later lossy
 stage.
 """
+
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.lossless_compaction import search_unheading
 
@@ -19,25 +20,42 @@ def _grep_block() -> str:
         "src/services/wallet/overdraft/automated_overdraft_initiation.py",
         "src/services/wallet/overdraft/capacity_limits.py",
     ]
-    return "\n".join(
-        f"{p}:{ln}:    result = compute_overdraft_capacity(business_id, amount)"
-        for p in paths for ln in range(1, 40)
-    ) + "\n"
+    return (
+        "\n".join(
+            f"{p}:{ln}:    result = compute_overdraft_capacity(business_id, amount)"
+            for p in paths
+            for ln in range(1, 40)
+        )
+        + "\n"
+    )
 
 
 def _code_block() -> str:
-    return "\n".join(
-        f"    def method_{i}(self, arg_{i}):\n        return self.reg[{i}] + arg_{i} * {i}"
-        for i in range(40)
-    ) + "\n"
+    return (
+        "\n".join(
+            f"    def method_{i}(self, arg_{i}):\n        return self.reg[{i}] + arg_{i} * {i}"
+            for i in range(40)
+        )
+        + "\n"
+    )
 
 
 def _compress(content: str, *, lossless: bool):
     router = ContentRouter(ContentRouterConfig(lossless=lossless))
     tr: list[str] = []
     out, was = router._compress_block_content(
-        content, hash((content, lossless)), "", 1.0, 1.0, None, tr, {}, [],
-        "tool_result", "tool", True,
+        content,
+        hash((content, lossless)),
+        "",
+        1.0,
+        1.0,
+        None,
+        tr,
+        {},
+        [],
+        "tool_result",
+        "tool",
+        True,
     )
     return out, was, tr
 
@@ -95,7 +113,18 @@ def test_lossless_mode_non_foldable_is_lossless_noop_not_ratio_too_high():
     code = "\n".join(f"    x{i} = compute_value({i}, offset={i * 3})" for i in range(60)) + "\n"
     rc: dict = {}
     out, was = router._compress_block_content(
-        code, hash(code), "", 1.0, 1.0, None, [], rc, [], "tool_result", "tool", True,
+        code,
+        hash(code),
+        "",
+        1.0,
+        1.0,
+        None,
+        [],
+        rc,
+        [],
+        "tool_result",
+        "tool",
+        True,
     )
     assert was is False
     assert rc.get("lossless_noop", 0) >= 1

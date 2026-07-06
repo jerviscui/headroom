@@ -1,4 +1,5 @@
 """Cross-turn dedup: cache-safety (prefix-monotonicity) + accuracy (info-preserving)."""
+
 import re
 
 from headroom.transforms.cross_turn_dedup import (
@@ -117,26 +118,31 @@ def test_info_preserving_reconstruction_multiref():
 def _mk_tok():
     from headroom.providers import OpenAIProvider
     from headroom.tokenizer import Tokenizer
+
     return Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
 
 
 def _toolmsg(text, tid):
-    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}]}
+    return {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}],
+    }
 
 
 def _apply_fresh(messages):
     # Fresh router per call: tests the pure-function (prefix-monotonic) property,
     # not cross-call cache state.
-    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
     import copy
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
     r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
     return r.apply(copy.deepcopy(messages), _mk_tok()).messages
 
 
 def test_apply_dedups_reread_and_keeps_prefix_stable():
     span = "\n".join(
-        f"    result_{i} = compute_overdraft(business_id={i}, amount={i * 100})"
-        for i in range(12)
+        f"    result_{i} = compute_overdraft(business_id={i}, amount={i * 100})" for i in range(12)
     )
     m1 = [
         {"role": "user", "content": "fix the overdraft bug"},
@@ -166,33 +172,34 @@ def test_apply_dedups_reread_and_keeps_prefix_stable():
             for b in m["content"]
             if isinstance(b, dict) and b.get("type") == "tool_result"
         ]
+
     assert _tool_texts(out2)[:1] == _tool_texts(out1)  # t1 block byte-identical
 
 
 def test_apply_no_dedup_when_flag_off():
     span = "\n".join(f"    v_{i} = f({i})" for i in range(12))
-    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
     import copy
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
     msgs = [
         _toolmsg(f"a\n{span}", "t1"),
         _toolmsg(f"b\n{span}", "t2"),
     ]
     r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=False))
     out = r.apply(copy.deepcopy(msgs), _mk_tok()).messages
-    joined = "".join(
-        b["content"] for m in out for b in m["content"] if isinstance(b, dict)
-    )
+    joined = "".join(b["content"] for m in out for b in m["content"] if isinstance(b, dict))
     assert "[headroom:" not in joined
 
 
 def test_apply_dedup_runs_in_ccr_mode_too():
     # Dedup is no longer gated to lossless mode: with lossless=False (CCR) and
     # the flag on, an exact re-read still folds to an in-context pointer.
-    span = "\n".join(
-        f"    total_{i} = reconcile(entry_id={i}, ledger=book_{i})" for i in range(12)
-    )
-    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    span = "\n".join(f"    total_{i} = reconcile(entry_id={i}, ledger=book_{i})" for i in range(12))
     import copy
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
     msgs = [
         _toolmsg(f"$ cat ledger.py\n{span}\n# eof", "t1"),
         {"role": "assistant", "content": "re-check"},
@@ -201,7 +208,10 @@ def test_apply_dedup_runs_in_ccr_mode_too():
     r = ContentRouter(ContentRouterConfig(lossless=False, enable_cross_turn_dedup=True))
     out = r.apply(copy.deepcopy(msgs), _mk_tok()).messages
     joined = "".join(
-        b["content"] for m in out if isinstance(m.get("content"), list)
-        for b in m["content"] if isinstance(b, dict)
+        b["content"]
+        for m in out
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict)
     )
     assert "[headroom:" in joined  # dedup fired despite lossless=False

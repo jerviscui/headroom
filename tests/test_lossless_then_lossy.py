@@ -9,10 +9,11 @@ otherwise the pure byte-exact fold is kept, so A7 is never worse than A6.
 DIFF content is never lossy-chained (Kompressing hunks breaks ``git apply``).
 Kompress is mocked so these run without the ModernBERT model.
 """
+
 from headroom.transforms.content_router import (
+    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
-    CompressionStrategy,
 )
 from headroom.transforms.lossless_compaction import search_unheading
 
@@ -23,21 +24,28 @@ def _grep_block() -> str:
         "src/services/wallet/overdraft/automated_overdraft_initiation.py",
         "src/services/wallet/overdraft/capacity_limits.py",
     ]
-    return "\n".join(
-        f"{p}:{ln}:    result = compute_overdraft_capacity(business_id, amount)"
-        for p in paths for ln in range(1, 40)
-    ) + "\n"
+    return (
+        "\n".join(
+            f"{p}:{ln}:    result = compute_overdraft_capacity(business_id, amount)"
+            for p in paths
+            for ln in range(1, 40)
+        )
+        + "\n"
+    )
 
 
 def _diff_block() -> str:
     files = ["foo", "bar", "baz"]
-    return "\n".join(
-        f"diff --git a/{f}.py b/{f}.py\n"
-        f"index 1111111aaaaaaa..2222222bbbbbbb 100644\n"
-        f"--- a/{f}.py\n+++ b/{f}.py\n"
-        f"@@ -1,3 +1,3 @@\n-    old_{f} = 1\n+    new_{f} = 2\n     unchanged_{f}"
-        for f in files
-    ) + "\n"
+    return (
+        "\n".join(
+            f"diff --git a/{f}.py b/{f}.py\n"
+            f"index 1111111aaaaaaa..2222222bbbbbbb 100644\n"
+            f"--- a/{f}.py\n+++ b/{f}.py\n"
+            f"@@ -1,3 +1,3 @@\n-    old_{f} = 1\n+    new_{f} = 2\n     unchanged_{f}"
+            for f in files
+        )
+        + "\n"
+    )
 
 
 def _router(*, lossless_then_lossy, lossless=False, ccr=False, kompress=None):
@@ -62,8 +70,18 @@ def _router(*, lossless_then_lossy, lossless=False, ccr=False, kompress=None):
 def _run(r, content):
     tr, rc = [], {}
     out, was = r._compress_block_content(
-        content, hash(content), "", 1.0, 1.0, None, tr, rc, [],
-        "tool_result", "tool", True,
+        content,
+        hash(content),
+        "",
+        1.0,
+        1.0,
+        None,
+        tr,
+        rc,
+        [],
+        "tool_result",
+        "tool",
+        True,
     )
     return out, was, tr, rc
 
@@ -129,11 +147,10 @@ def test_a7_gain_gate_boundary_default_095(monkeypatch):
     block = _grep_block()
     r, _ = _router(lossless_then_lossy=True)
     assert abs(r._a7_min_lossy_gain - 0.95) < 1e-9  # default is 0.95
-    fold_tok = len(r._lossless_first(block, __import__("headroom.transforms.content_router",
-        fromlist=["CompressionStrategy"]).CompressionStrategy.SEARCH)[0].split())
+    fold_tok = len(r._lossless_first(block, CompressionStrategy.SEARCH)[0].split())
     # Kompress that removes ~6% of fold tokens -> ratio ~0.94 <= 0.95 -> chained.
     keep = int(fold_tok * 0.94)
-    r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"]*keep), keep)  # type: ignore
+    r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"] * keep), keep)  # type: ignore
     _, was, tr, rc = _run(r, block)
     assert was is True and rc.get("lossless_then_lossy_accept") == 1
     # Same result would be REJECTED under the old 0.90 gate (0.94 > 0.90).
@@ -144,10 +161,9 @@ def test_a7_gain_gate_env_override(monkeypatch):
     r, _ = _router(lossless_then_lossy=True)
     assert abs(r._a7_min_lossy_gain - 0.80) < 1e-9  # env override wins
     block = _grep_block()
-    fold_tok = len(r._lossless_first(block, __import__("headroom.transforms.content_router",
-        fromlist=["CompressionStrategy"]).CompressionStrategy.SEARCH)[0].split())
+    fold_tok = len(r._lossless_first(block, CompressionStrategy.SEARCH)[0].split())
     keep = int(fold_tok * 0.90)  # 10% cut: passes 0.95 default but FAILS the 0.80 override
-    r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"]*keep), keep)  # type: ignore
+    r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"] * keep), keep)  # type: ignore
     _, was, tr, rc = _run(r, block)
     assert rc.get("lossless_accept") == 1  # kept pure fold under strict 0.80 gate
     assert rc.get("lossless_then_lossy_accept", 0) == 0

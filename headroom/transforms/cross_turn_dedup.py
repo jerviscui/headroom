@@ -59,8 +59,21 @@ def _is_trivial(line: str) -> bool:
     if len(s) < 4:
         return True
     return s in {
-        "return", "pass", "else:", "try:", "except:", "finally:", "break",
-        "continue", "});", "})", "],", "),", "\"\"\"", "'''", "...",
+        "return",
+        "pass",
+        "else:",
+        "try:",
+        "except:",
+        "finally:",
+        "break",
+        "continue",
+        "});",
+        "})",
+        "],",
+        "),",
+        '"""',
+        "'''",
+        "...",
     }
 
 
@@ -81,7 +94,7 @@ def _pointer(span: list[str], ref_turn: int, ref_line: int) -> str:
 
 
 def _index_lines(
-    lines: list[str],
+    lines: list[str | None],
     block_pos: int,
     anchor_index: dict[str, list[tuple[int, int]]],
 ) -> None:
@@ -155,7 +168,7 @@ def dedup_blocks(
             if blk.protected:
                 # Never rewrite; still a valid verbatim reference target.
                 verbatim: list[str | None] = list(lines)
-                _index_lines(lines, len(corpus), anchor_index)
+                _index_lines(verbatim, len(corpus), anchor_index)
                 corpus.append(verbatim)
                 out_blocks.append(blk)
                 continue
@@ -187,11 +200,9 @@ def dedup_blocks(
                 i += 1
 
             # Index only the surviving verbatim lines of THIS block (first-seen).
-            _index_lines(
-                [v if v is not None else None for v in verbatim],
-                len(corpus),
-                anchor_index,
-            )
+            # None entries (folded spans) are kept in place so positions stay
+            # aligned with ``corpus``; _index_lines skips them.
+            _index_lines(verbatim, len(corpus), anchor_index)
             corpus.append(verbatim)
             out_blocks.append(DedupBlock(text="\n".join(out), turn=blk.turn, protected=False))
 
@@ -200,8 +211,12 @@ def dedup_blocks(
         return blocks, {"spans_folded": 0, "lines_removed": 0, "chars_removed": 0, "error": True}
 
 
-def is_prefix_monotonic(blocks: list[DedupBlock], *, min_lines: int = DEFAULT_MIN_LINES,
-                        min_chars: int = DEFAULT_MIN_CHARS) -> bool:
+def is_prefix_monotonic(
+    blocks: list[DedupBlock],
+    *,
+    min_lines: int = DEFAULT_MIN_LINES,
+    min_chars: int = DEFAULT_MIN_CHARS,
+) -> bool:
     """CACHE-SAFETY invariant: for every k, dedup(blocks[:k]) equals dedup(full)
     truncated to its first k blocks. i.e. appending a later turn never changes an
     earlier turn's rewritten bytes, so the prompt-cache prefix stays stable."""

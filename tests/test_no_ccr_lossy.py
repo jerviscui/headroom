@@ -6,12 +6,13 @@ but only makes sense when retrieval markers are ON. In no-CCR mode
 result IS the intended output. This tests both directions without needing the
 ModernBERT model (self.compress is mocked to a lossy result).
 """
+
 from types import SimpleNamespace
 
 from headroom.transforms.content_router import (
+    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
-    CompressionStrategy,
 )
 
 
@@ -27,8 +28,18 @@ def _run(marker_on):
     r.compress = lambda content, context=None, bias=1.0: fake  # type: ignore
     tr, rc = [], {}
     out, was = r._compress_block_content(
-        orig, hash((orig, marker_on)), "", 1.0, 1.0, None, tr, rc, [],
-        "tool_result", "tool", enforce_reversibility=True,
+        orig,
+        hash((orig, marker_on)),
+        "",
+        1.0,
+        1.0,
+        None,
+        tr,
+        rc,
+        [],
+        "tool_result",
+        "tool",
+        enforce_reversibility=True,
     )
     return was, rc
 
