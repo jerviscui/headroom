@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .marker import CCR_TERSE_MARKER_RE
+
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
@@ -135,12 +137,13 @@ Some tool outputs have been compressed to reduce context size. If you need
 the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+- Call `{CCR_TOOL_NAME}(hash="<id>")` to get the full original content back
 
-**Available hashes:** {hash_list}
+**Available ids:** {hash_list}
 
-Look for markers like `[N items compressed to M. Retrieve more: hash=abc123]`
-in tool results to find the hash for each compressed output.
+Look for a marker in tool results and pass its `<id>` to `{CCR_TOOL_NAME}`:
+- `[ccr:<id>]` — the compact form, or
+- `[N items compressed to M. Retrieve more: hash=<id>]` — the verbose form.
 """
 
 
@@ -181,24 +184,24 @@ class CCRToolInjector:
     # - Generic: any [... compressed ... hash=xxx] pattern
     _marker_patterns: list[re.Pattern] = field(
         default_factory=lambda: [
-            # Hash length is validated by the patterns themselves. Legacy
-            # bracket markers carry a 24-hex-char hash (SHA-256[:24], 96 bits
-            # for collision resistance); SmartCrusher's `<<ccr:>>` markers carry
-            # a 12-hex-char hash (see transforms/smart_crusher.py and
-            # cache/compression_store.py). Both real lengths are accepted.
+            # Hash width is VARIABLE. The store hands out the full 24-hex
+            # SHA-256[:24] by default, but the adaptive labeler
+            # (HEADROOM_CCR_SHORT_LABELS) issues the shortest unique hex prefix —
+            # as few as 2 chars — so every hex pattern accepts 2-24 chars.
+            # SmartCrusher's `<<ccr:>>` markers still carry 12-24. The last
+            # capture group is always the hash/id (see _scan_text).
             #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
-            # Matches items, lines, matches, or any other type
-            re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
+            re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{2,24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
-            re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
-            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
-            # SmartCrusher markers: the row-drop summary
-            # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
-            # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
-            # space, comma, or the closing `>>`.
+            re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{2,24})\]"),
+            # Generic fallback: any bracket compression marker with a hash
+            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{2,24})\]", re.IGNORECASE),
+            # SmartCrusher markers: `<<ccr:HASH ...>>` / `<<ccr:HASH,KIND,SIZE>>`.
             re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
+            # Terse marker (HEADROOM_CCR_TERSE_MARKER): `[ccr:<id>]`. The single
+            # capture group is the id to retrieve. Defined once in ccr/marker.py.
+            CCR_TERSE_MARKER_RE,
         ]
     )
 
