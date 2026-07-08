@@ -2027,6 +2027,51 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
+            # Server-side Tool Search (opt-in HEADROOM_TOOL_SEARCH): defer the
+            # non-core tool schemas behind a tool_search tool so Anthropic excludes
+            # them from the context window — they stop counting as input tokens until
+            # the model searches for one — while every tool stays callable.
+            # Deterministic → the tools prefix still prompt-caches. Safe for opencode:
+            # its @ai-sdk/anthropic parses the server_tool_use / tool_search_tool_result
+            # round-trip natively, and its cache breakpoints sit on messages (never
+            # tools), so defer_loading cannot collide with cache_control. We COUNT the
+            # deferred tool-schema tokens as the tool-search input-token saving (those
+            # bytes are excluded from context this turn); the response usage confirms it.
+            #
+            # FIRST-PARTY ANTHROPIC ONLY: the tool_search_tool_* type + defer_loading
+            # here use the first-party Claude API shape (GA, no beta header). Bedrock
+            # (``anthropic_backend``) and Vertex/gateway providers gate tool search
+            # differently, so scope the injection to provider "anthropic" over the
+            # direct API and leave those paths untouched.
+            if (
+                provider_name == "anthropic"
+                and getattr(self, "anthropic_backend", None) is None
+                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+                in ("1", "true", "yes", "on", "auto")
+            ):
+                from headroom.proxy.helpers import inject_tool_search_deferral
+
+                _ts_before = body.get("tools")
+                _ts_after = inject_tool_search_deferral(_ts_before)
+                if _ts_after is not _ts_before:
+                    _ts_deferred = [
+                        t for t in _ts_after if isinstance(t, dict) and t.get("defer_loading")
+                    ]
+                    try:
+                        _ts_saved_tokens = tokenizer.count_text(
+                            json.dumps(_ts_deferred, default=str)
+                        )
+                    except Exception:
+                        _ts_saved_tokens = 0
+                    body["tools"] = _ts_after
+                    tools = _ts_after
+                    tags["tool_search_deferred_tools"] = len(_ts_deferred)
+                    tags["tool_search_deferred_tokens"] = _ts_saved_tokens
+                    transforms_applied.append(
+                        f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
+                        f"{_ts_saved_tokens}tok"
+                    )
+
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
             # mechanical tool_result continuations. Runs after every other

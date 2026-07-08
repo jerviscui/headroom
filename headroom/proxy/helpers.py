@@ -3072,3 +3072,97 @@ def reset_tool_search_hint_state() -> None:
     global _tool_search_hint_emitted
     with _tool_search_hint_lock:
         _tool_search_hint_emitted = False
+
+
+# ---------------------------------------------------------------------------
+# Server-side Tool Search injection (opencode / non-Claude-Code clients).
+#
+# Clients that eagerly materialize every tool schema (opencode ships ~135 tool
+# defs ≈ 28k tokens on EVERY request) never opt into Anthropic's Tool Search
+# Tool themselves. Unlike the Claude Code case above — where the schemas are
+# already in the client's own context and the proxy can't reverse it — a plain
+# API client's tools live only in the request body, so the proxy CAN defer them:
+# mark the non-core tools ``defer_loading: true`` and inject a tool_search tool.
+# Anthropic then excludes deferred tools from the context window (they stop
+# counting as input tokens until the model searches for one), while every tool
+# stays callable. Deterministic output → the tools prefix still prompt-caches.
+# ---------------------------------------------------------------------------
+
+# Core coding tools kept non-deferred so routine edit/read/run loops never pay a
+# search round-trip. Everything else (Slack/Linear/Sentry/Notion/Snowflake/…) is
+# deferred and loaded on demand. Anthropic recommends keeping the 3–5 (here a few
+# more) most frequent tools resident.
+_TOOL_SEARCH_CORE_TOOLS = frozenset(
+    {
+        "bash", "bash_background", "bash_background_output", "bash_background_wait",
+        "bash_background_kill", "read", "write", "edit", "multiedit", "apply_patch",
+        "glob", "grep", "task", "todowrite", "todoread", "webfetch", "question", "skill",
+    }
+)
+_TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
+_TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
+# Below this many tools the ~search round-trip isn't worth it (Anthropic's own
+# guidance: standard calling is better under ~10 tools).
+_TOOL_SEARCH_MIN_TOOLS = 12
+
+
+def inject_tool_search_deferral(
+    tools: Any,
+    *,
+    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
+    search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
+) -> Any:
+    """Return a new ``tools`` list with non-core tools deferred + a search tool
+    injected, or the original list unchanged when injection doesn't apply.
+
+    No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, a tool_search
+    tool is already present (client already defers), or nothing would be deferred.
+
+    Invariants enforced (else Anthropic 400s): the search tool is never deferred;
+    at least one tool stays non-deferred; a deferred tool never carries
+    ``cache_control`` — if the client's tools cache breakpoint sat on a now-deferred
+    tool, it is moved to the last non-deferred real tool so the (smaller) tools
+    prefix still caches.
+    """
+    if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
+        return tools
+    for tool in tools:
+        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
+            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        ):
+            return tools  # client already uses tool search — leave it alone
+
+    search_tool = {"type": search_type, "name": search_name}
+    out: list[Any] = [search_tool]
+    deferred = 0
+    dropped_cache_control = False
+    last_resident_real: dict[str, Any] | None = None
+    resident_has_cache_control = False
+
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+            # Non-dict, server/typed tools (web_search, computer, …), and core
+            # tools stay resident and unchanged.
+            out.append(tool)
+            if isinstance(tool, dict) and not tool.get("type"):
+                last_resident_real = tool
+                resident_has_cache_control = resident_has_cache_control or bool(
+                    tool.get("cache_control")
+                )
+            continue
+        new_tool = dict(tool)
+        new_tool["defer_loading"] = True
+        if new_tool.pop("cache_control", None) is not None:
+            dropped_cache_control = True
+        out.append(new_tool)
+        deferred += 1
+
+    if deferred == 0:
+        return tools  # nothing to defer → don't perturb the cache prefix
+    # Preserve a tools cache breakpoint: if we stripped cache_control off a
+    # deferred tool and no resident tool carries one, move it to the last
+    # resident real tool (never the search tool, to keep its shape canonical).
+    if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
+        last_resident_real["cache_control"] = {"type": "ephemeral"}
+    return out
