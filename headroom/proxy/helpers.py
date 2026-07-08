@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -3094,9 +3095,24 @@ def reset_tool_search_hint_state() -> None:
 # more) most frequent tools resident.
 _TOOL_SEARCH_CORE_TOOLS = frozenset(
     {
-        "bash", "bash_background", "bash_background_output", "bash_background_wait",
-        "bash_background_kill", "read", "write", "edit", "multiedit", "apply_patch",
-        "glob", "grep", "task", "todowrite", "todoread", "webfetch", "question", "skill",
+        "bash",
+        "bash_background",
+        "bash_background_output",
+        "bash_background_wait",
+        "bash_background_kill",
+        "read",
+        "write",
+        "edit",
+        "multiedit",
+        "apply_patch",
+        "glob",
+        "grep",
+        "task",
+        "todowrite",
+        "todoread",
+        "webfetch",
+        "question",
+        "skill",
     }
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
@@ -3165,4 +3181,108 @@ def inject_tool_search_deferral(
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
         last_resident_real["cache_control"] = {"type": "ephemeral"}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
+#
+# The OpenAI-side analogue of inject_tool_search_deferral above. OpenAI shipped
+# the same idea for the Responses API on gpt-5.4+: mark a function/MCP tool
+# ``defer_loading: true`` and add a ``{"type": "tool_search"}`` tool, and OpenAI
+# keeps the deferred tools' heavy parameter schemas OUT of the model's context
+# (only name+description remain) until the model searches for one — while every
+# tool stays callable and the prompt cache is preserved. Same win as Anthropic
+# (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
+# and never opt into tool search themselves (opencode, plain API clients).
+#
+# Differences from the Anthropic path that require a separate function:
+#   * Responses function tools carry ``type: "function"`` (Anthropic real tools
+#     have no ``type``), so the resident/defer test is inverted — we defer
+#     ``function`` (non-core) and ``mcp`` tools and keep OTHER typed/hosted tools
+#     (web_search, file_search, code_interpreter, computer, image_generation, and
+#     the search tool itself) resident.
+#   * Model-gated: only gpt-5.4+ support it; older models 400 on the fields.
+#   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
+# ---------------------------------------------------------------------------
+
+_OPENAI_TOOL_SEARCH_TYPE = "tool_search"
+_OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
+# gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
+# gated by default; overridable per deployment via a regex in
+# HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
+# model families can be enabled without a code edit + release.
+_OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
+
+
+def _model_supports_openai_tool_search(model: str | None) -> bool:
+    """True when an OpenAI model supports the Responses ``tool_search`` feature.
+
+    Default gate: ``gpt-<major>.<minor>`` >= 5.4. A regex in
+    ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
+    when set; a malformed pattern falls back to the version gate rather than
+    crashing.
+    """
+    if not model:
+        return False
+    override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
+    if override:
+        try:
+            return re.search(override, model) is not None
+        except re.error:
+            pass  # malformed override → fall back to the version gate
+    match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2) or 0)
+    return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
+
+
+def inject_tool_search_deferral_openai(
+    tools: Any,
+    model: str | None,
+    *,
+    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+) -> Any:
+    """Return a new Responses ``tools`` list with non-core function/MCP tools
+    deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
+    unchanged when injection doesn't apply.
+
+    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
+    tool_search tool is already present (client already defers), or nothing would
+    be deferred. Core coding tools and hosted/typed tools (web_search,
+    file_search, code_interpreter, computer, …) stay resident and unchanged, so
+    routine edit/read/run loops never pay a search round-trip and the request
+    stays valid; the injected search tool is itself resident.
+    """
+    if not _model_supports_openai_tool_search(model):
+        return tools
+    if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
+        return tools
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE:
+            return tools  # client already uses tool search — leave it alone
+
+    out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
+    deferred = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        ttype = tool.get("type")
+        # Deferrable: a non-core function, or an MCP server (OpenAI models are
+        # trained to search namespaces / MCP servers). Everything else — core
+        # coding tools and other hosted tools — stays resident.
+        deferrable = (ttype == "function" and tool.get("name") not in core_tools) or ttype == "mcp"
+        if deferrable and not tool.get("defer_loading"):
+            new_tool = dict(tool)
+            new_tool["defer_loading"] = True
+            out.append(new_tool)
+            deferred += 1
+        else:
+            out.append(tool)
+
+    if deferred == 0:
+        return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
