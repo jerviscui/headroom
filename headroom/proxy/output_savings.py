@@ -42,7 +42,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, cast
 
 # Coarse input-token buckets. Coarse on purpose: too many strata make
 # per-stratum baselines sparse and noisy. Boundaries in tokens.
@@ -97,6 +97,50 @@ def stratum_key(
     )
 
 
+def _unwrap_response_create_body(body: dict[str, Any]) -> dict[str, Any]:
+    response = body.get("response")
+    if body.get("type") == "response.create" and isinstance(response, dict):
+        return cast("dict[str, Any]", response)
+    return body
+
+
+def _stable_response_identifier(body: dict[str, Any]) -> str:
+    def _string_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("id", "conversation_id", "session_id", "thread_id"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested:
+                    return nested
+        return ""
+
+    for key in ("conversation", "conversation_id", "session_id", "thread_id"):
+        value = _string_value(body.get(key))
+        if value and value.lower() != "auto":
+            return f"{key}:{value}"
+
+    for container_key in ("client_metadata", "metadata"):
+        container = body.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "conversation_id",
+            "conversation_key",
+            "session_id",
+            "thread_id",
+            "codex_session_id",
+        ):
+            value = _string_value(container.get(key))
+            if value and value.lower() != "auto":
+                return f"{container_key}.{key}:{value}"
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        return f"instructions:{instructions[:512]}"
+    return ""
+
+
 def conversation_key_from_body(body: dict[str, Any]) -> str:
     """Derive a conversation-stable key for holdout assignment.
 
@@ -105,6 +149,7 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
     message's text. The first user turn is immutable for a conversation's
     lifetime, which is exactly the stability we need.
     """
+    body = _unwrap_response_create_body(body)
     model = str(body.get("model", ""))
     seed = model
     for msg in body.get("messages", []):
@@ -118,6 +163,12 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
                         seed += "\x00" + str(block.get("text", ""))[:512]
                         break
             break
+    if "input" in body:
+        stable_response_key = _stable_response_identifier(body)
+        if stable_response_key:
+            seed += "\x00" + stable_response_key
+        elif not body.get("messages"):
+            seed += "\x00responses"
     return hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -162,6 +213,16 @@ class _Accum:
             return 0.0
         return max(0.0, (self.sumsq - self.sum * self.sum / self.n) / (self.n - 1))
 
+    def merge(self, other: _Accum) -> None:
+        """Fold another accumulator's observations into this one.
+
+        n / sum / sumsq are additive, so merging is element-wise addition and
+        is exactly equivalent to having ``add``-ed both observation streams.
+        """
+        self.n += other.n
+        self.sum += other.sum
+        self.sumsq += other.sumsq
+
     def to_dict(self) -> dict[str, float]:
         return {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
 
@@ -189,6 +250,19 @@ class BaselineModel:
     def observe(self, key: str, output_tokens: int) -> None:
         self.strata.setdefault(key, _Accum()).add(output_tokens)
         self.glob.add(output_tokens)
+
+    def merge(self, other: BaselineModel) -> None:
+        """Fold another baseline's observations into this one.
+
+        Per-stratum and global accumulators are additive, so merging is
+        element-wise and order-independent — the result is identical to having
+        observed both corpora against a single model. Used to aggregate a
+        cross-project baseline from per-project ``analyze`` results without
+        re-reading transcripts.
+        """
+        for key, acc in other.strata.items():
+            self.strata.setdefault(key, _Accum()).merge(acc)
+        self.glob.merge(other.glob)
 
     def lookup(self, key: str) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
@@ -451,8 +525,40 @@ class SavingsRecorder:
             return True
         return False
 
-    def _flush_locked(self) -> None:
+    def _reload_baseline_locked(self) -> None:
+        """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
+
+        ``learn`` rewrites the baseline in place in the same file a running proxy
+        holds open, while the recorder only ever appends treatment/control
+        samples and never touches the baseline. Without re-reading it, two things
+        break: (1) a baseline learned while the proxy is up never takes effect
+        until a restart, so treatment lookups all miss (``m == 0``) and the
+        output-reduction tile stays at "—"; and (2) our periodic flush would
+        write our in-memory (empty) baseline straight over the one ``learn`` just
+        persisted.
+
+        Adopt the disk baseline whenever it carries samples and differs from
+        ours. Comparing content (not just sample count) means a re-learn with the
+        same number of samples still takes effect, and the empty-disk guard keeps
+        a truncated file from wiping a baseline we already hold."""
         try:
+            disk = SavingsLedger.load(self._path)
+        except OSError:
+            return
+        if disk.baseline.total_samples == 0:
+            return
+        if disk.baseline.to_dict() != self._ledger.baseline.to_dict():
+            self._ledger.baseline = disk.baseline
+
+    def _flush_locked(self) -> None:
+        from ..paths import process_is_stateless
+
+        if process_is_stateless():
+            # Stateless: keep the in-memory ledger but never write to disk.
+            self._since_flush = 0
+            return
+        try:
+            self._reload_baseline_locked()
             self._ledger.save(self._path)
             self._since_flush = 0
         except OSError:
@@ -464,6 +570,7 @@ class SavingsRecorder:
 
     def estimate(self) -> SavingsEstimate:
         with self._lock:
+            self._reload_baseline_locked()
             return self._ledger.best_estimate()
 
 

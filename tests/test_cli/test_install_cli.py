@@ -52,6 +52,53 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     assert calls == ["save", "start_service"]
 
 
+def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations = []
+        artifacts = []
+
+    manifest = Manifest()
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+    result = runner.invoke(main, ["install", "apply", "--no-http2"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["no_http2"] is True
+
+
+def test_install_apply_help_lists_no_http2() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["install", "apply", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--no-http2" in result.output
+
+
 def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 
@@ -133,6 +180,57 @@ def test_install_apply_rejects_provider_scope_targets_without_support() -> None:
 
     assert result.exit_code != 0
     assert "Provider scope supports only claude, codex, openclaw, and opencode" in result.output
+
+
+def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "provider"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["opencode"]
+        mutations = []
+        artifacts = []
+
+    manifest = Manifest()
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "install",
+            "apply",
+            "--scope",
+            "provider",
+            "--providers",
+            "manual",
+            "--target",
+            "opencode",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"] == ["opencode"]
+    assert "Targets: opencode" in result.output
 
 
 def test_install_apply_restores_previous_deployment_after_failed_update(monkeypatch) -> None:
@@ -267,6 +365,15 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     )
     monkeypatch.setattr(
         "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+    # _start_deployment guards the persistent-docker preset with
+    # `shutil.which("docker")`. Fake docker as present so the test exercises the
+    # runtime-selection path itself rather than the host's docker install —
+    # otherwise it passes on dev machines with Docker but fails on CI runners
+    # (e.g. macos-latest) that have no docker on PATH.
+    monkeypatch.setattr(
+        "headroom.cli.install.shutil.which",
+        lambda name, *args, **kwargs: "/usr/local/bin/docker" if name == "docker" else None,
     )
 
     result = runner.invoke(main, ["install", "apply", "--preset", "persistent-docker"])
