@@ -405,6 +405,10 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr(
         "headroom.cli.install._command_available", lambda command: command == "docker"
     )
+    monkeypatch.setattr(
+        "headroom.cli.install.shutil.which",
+        lambda name, *args, **kwargs: "/usr/local/bin/docker" if name == "docker" else None,
+    )
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
@@ -452,6 +456,10 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.cli.install._detect_nvidia_gpu_names", lambda: ["RTX 4090"])
     monkeypatch.setattr("headroom.cli.install._docker_supports_nvidia_gpus", lambda: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.shutil.which",
+        lambda name, *args, **kwargs: "/usr/local/bin/docker" if name == "docker" else None,
+    )
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
