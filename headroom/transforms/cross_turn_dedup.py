@@ -186,9 +186,11 @@ def _longest_match(
         block_lines = corpus[bp]
         k = 0
         delta: int | None = None
-        while start + k < len(cur) and li + k < len(block_lines) and block_lines[li + k] is not None:
+        while start + k < len(cur) and li + k < len(block_lines):
             ca = cur[start + k]
             cb = block_lines[li + k]
+            if cb is None:  # end of a folded block in the corpus — run ends here
+                break
             na, ka, _ = _num_and_key(ca)
             nb, kb, _ = _num_and_key(cb)
             if ka != kb:

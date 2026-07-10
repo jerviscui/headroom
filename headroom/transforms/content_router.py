@@ -4237,6 +4237,24 @@ class ContentRouter(Transform):
 
             locs: list[tuple[int, int | None, int | None]] = []
             dblocks: list[DedupBlock] = []
+
+            def _is_user_read_observation(idx: int) -> bool:
+                # A file read can land in a plain ``role:user`` STRING (text
+                # harnesses: the assistant emits a fenced ``cat/sed/head …`` and the
+                # output comes back as the next user turn). Fold those too, but ONLY
+                # when the preceding assistant turn actually issued a read command —
+                # never ordinary user prose. Same OUTCOME the router uses to protect
+                # reads, re-derived here on dedup's own array so indices stay
+                # self-consistent (no coupling to pre-scan positional indices).
+                for j in range(idx - 1, -1, -1):
+                    rj = messages[j].get("role")
+                    if rj == "assistant":
+                        cmd = _fenced_shell_command(messages[j].get("content"))
+                        return bool(cmd and _is_read_command(cmd))
+                    if rj == "user":
+                        return False
+                return False
+
             for i, msg in enumerate(messages):
                 content = msg.get("content")
                 frozen = i < frozen_message_count
@@ -4270,12 +4288,18 @@ class ContentRouter(Transform):
                                 dblocks.append(
                                     DedupBlock(text=sub["text"], turn=i, protected=protected)
                                 )
-                elif isinstance(content, str) and msg.get("role") == "tool":
-                    if not content:
-                        continue
-                    protected = frozen or ("cache_control" in msg)
-                    locs.append((i, None, None))
-                    dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
+                elif isinstance(content, str) and content:
+                    # Tool output as a STRING under any harness label: OpenAI/Kimi
+                    # ``role:tool``, legacy ``role:function``, or a text-harness
+                    # ``role:user`` read output. Key off the OUTCOME, not the role —
+                    # ``role:user`` is gated to genuine reads so prose never folds.
+                    role = msg.get("role")
+                    if role in ("tool", "function") or (
+                        role == "user" and _is_user_read_observation(i)
+                    ):
+                        protected = frozen or ("cache_control" in msg)
+                        locs.append((i, None, None))
+                        dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
 
             if len(dblocks) < 2:
                 return messages
