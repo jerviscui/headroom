@@ -37,6 +37,7 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
 
 if TYPE_CHECKING:
     import httpx
@@ -1994,133 +1995,13 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     return serialize_body_canonical(tool_definition)
 
 
-class SessionToolTracker:
-    """Bounded LRU tracker recording per-session memory-tool injection state.
-
-    Once memory injects tool definitions into a session, future requests
-    in that session always inject the byte-equal same definitions —
-    never toggling on/off mid-session (guide §6.3 #2). The first turn's
-    canonical bytes are stored as the golden definition; subsequent
-    turns reuse those bytes verbatim.
-
-    State per session: ordered list of (tool_name → golden_bytes)
-    pairs. Order is preserved so the rebuilt tool list matches the
-    original injection order.
-
-    Bounded by ``max_sessions`` (default 1000) via ``OrderedDict`` LRU
-    eviction: hits move-to-end; overflow pops oldest. Reentrant lock so
-    future callers from inside another locked method don't self-deadlock
-    (mirrors `SessionBetaTracker` / `CompressionCache` pattern).
-
-    The tracker is provider-aware: the same ``session_id`` for Anthropic
-    and OpenAI keeps independent state (the tool schemas differ in
-    format).
-    """
+class SessionToolTracker(_SessionToolTracker):
+    """Env-aware compatibility wrapper for the pure session tool tracker."""
 
     def __init__(self, max_sessions: int | None = None) -> None:
         if max_sessions is None:
             max_sessions = get_tool_tracker_max_sessions()
-        if max_sessions <= 0:
-            raise ValueError("max_sessions must be > 0")
-        self._max_sessions: int = max_sessions
-        self._lock = threading.RLock()
-        # Value is an OrderedDict[tool_name -> golden_definition_bytes].
-        # Storing per-tool bytes (not the entire tools list) keeps the
-        # tracker resilient to non-memory tool list changes by the client
-        # (which are the client's responsibility, not ours to gate).
-        self._sessions: OrderedDict[tuple[str, str], OrderedDict[str, bytes]] = OrderedDict()
-
-    @property
-    def active_sessions(self) -> int:
-        with self._lock:
-            return len(self._sessions)
-
-    def _key(self, provider: str, session_id: str) -> tuple[str, str]:
-        return (provider, session_id)
-
-    def should_inject(self, provider: str, session_id: str) -> bool:
-        """Return True iff this session has previously injected memory tools.
-
-        Used by the sticky-on path: when memory is disabled this turn but
-        the session previously injected, we still inject the golden bytes.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return False
-            # LRU touch on read so the carry-over decision keeps the
-            # session in the hot set.
-            self._sessions.move_to_end(self._key(provider, session_id))
-            return len(entry) > 0
-
-    def get_golden_definitions(
-        self, provider: str, session_id: str
-    ) -> list[tuple[str, bytes]] | None:
-        """Return the previously-recorded (name, bytes) pairs for the session.
-
-        Returns ``None`` when the session has never injected memory tools.
-        Callers replay the bytes verbatim into ``body["tools"]``.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return None
-            self._sessions.move_to_end(self._key(provider, session_id))
-            # Snapshot — never expose internal storage directly.
-            return [(name, golden_bytes) for name, golden_bytes in entry.items()]
-
-    def record_injection(
-        self,
-        provider: str,
-        session_id: str,
-        tool_name: str,
-        tool_definition_bytes: bytes,
-    ) -> None:
-        """Record the golden bytes for a single memory tool in this session.
-
-        First-write wins: re-recording the same ``tool_name`` for an
-        existing session is a no-op (prevents drift if the canonical
-        serialization output changed between deploys mid-session). For
-        a *new* session, record fresh. LRU bound applies on every write.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        if not tool_name:
-            raise ValueError("tool_name must be non-empty")
-        if not tool_definition_bytes:
-            raise ValueError("tool_definition_bytes must be non-empty")
-
-        key = self._key(provider, session_id)
-
-        with self._lock:
-            entry = self._sessions.get(key)
-            if entry is None:
-                entry = OrderedDict()
-                self._sessions[key] = entry
-
-            # First-write wins: only record if not already pinned.
-            if tool_name not in entry:
-                entry[tool_name] = tool_definition_bytes
-
-            # LRU touch + bound enforcement.
-            self._sessions.move_to_end(key)
-            while len(self._sessions) > self._max_sessions:
-                self._sessions.popitem(last=False)
-
-    def reset(self) -> None:
-        """Clear all session state (test helper)."""
-        with self._lock:
-            self._sessions.clear()
+        super().__init__(max_sessions=max_sessions)
 
 
 # Process-wide singleton. Lazily replaced by tests via
