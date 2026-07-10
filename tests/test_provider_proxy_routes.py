@@ -495,8 +495,11 @@ def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> No
             response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
 
     assert response.status_code == 502
-    assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in response.text
+    assert response.text == "Upstream request failed."
     logger.error.assert_called_once()
+    assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in str(
+        logger.error.call_args
+    )
 
 
 def test_openai_response_subpath_passthrough_uses_openai_target() -> None:

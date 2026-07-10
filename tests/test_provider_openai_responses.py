@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -129,9 +131,12 @@ def test_handle_openai_responses_subpath_returns_502_on_failure() -> None:
         )
 
     with TestClient(app) as client:
-        response = client.delete("/probe/items/resp_1?trace=1")
+        with patch("headroom.providers.openai_responses.logger") as logger:
+            response = client.delete("/probe/items/resp_1?trace=1")
 
     assert response.status_code == 502
-    assert "boom: DELETE https://api.openai.example/v1/responses/items/resp_1?trace=1" in (
-        response.text
+    assert response.text == "Upstream request failed."
+    logger.error.assert_called_once()
+    assert "boom: DELETE https://api.openai.example/v1/responses/items/resp_1?trace=1" in str(
+        logger.error.call_args
     )
