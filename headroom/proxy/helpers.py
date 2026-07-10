@@ -37,6 +37,12 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.tool_injection_logging import (
+    ToolInjectionDecision,
+)
+from headroom.proxy.tool_injection_logging import (
+    log_tool_injection_decision as _log_tool_injection_decision,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -2154,12 +2160,7 @@ def log_tool_injection_decision(
     *,
     provider: str,
     session_id: str | None,
-    decision: Literal[
-        "inject_first_time",
-        "inject_sticky_replay",
-        "skip",
-        "skip_disabled_via_env",
-    ],
+    decision: ToolInjectionDecision,
     tool_definition_bytes_count: int,
     request_id: str | None,
 ) -> None:
@@ -2171,14 +2172,13 @@ def log_tool_injection_decision(
     tool definition contents (might contain user-specific schemas) per
     constraint #11.
     """
-    logger.info(
-        "event=tool_injection_decision provider=%s session_id=%s "
-        "decision=%s tool_definition_bytes_count=%d request_id=%s",
-        provider,
-        session_id or "",
-        decision,
-        tool_definition_bytes_count,
-        request_id or "",
+    _log_tool_injection_decision(
+        logger=logger,
+        provider=provider,
+        session_id=session_id,
+        decision=decision,
+        tool_definition_bytes_count=tool_definition_bytes_count,
+        request_id=request_id,
     )
 
 
