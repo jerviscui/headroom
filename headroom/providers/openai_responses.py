@@ -92,4 +92,4 @@ async def handle_openai_responses_subpath(
             _sanitize_for_log(sub_path),
             exc,
         )
-        return Response(content=str(exc), status_code=502)
+        return Response(content="Upstream request failed.", status_code=502)
