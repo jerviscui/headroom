@@ -2003,6 +2003,20 @@ class ContentRouter(Transform):
                 continue
             if len(cand) < len(best):
                 best, best_label = cand, f"lossless_{kind}"
+
+        # External lossless providers (opt-in; empty by default → no-op). Each
+        # proposal is VERIFIED for byte/JSON equivalence inside best_provider_fold
+        # before it can win, so an external provider can shrink more but can never
+        # introduce loss. Kept AFTER the built-in folds so OSS stays the floor.
+        from headroom.transforms.lossless_provider import (
+            LosslessCtx,
+            best_provider_fold,
+        )
+
+        external = best_provider_fold(content, LosslessCtx(content_type=strategy.value))
+        if external is not None and len(external[0]) < len(best):
+            best, best_label = external
+
         return best, best_label
 
     @staticmethod
