@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.proxy import sse_byte_buffer_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -561,22 +562,12 @@ def get_body_too_large_status() -> int:
     return value
 
 
-# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
-# spec the default event name is "message"; we return ``None`` so callers can
-# decide whether to apply that default.
-_SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+_SSE_EVENT_TERMINATORS = sse_byte_buffer_policy.SSE_EVENT_TERMINATORS
 
 
 def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
     """Return the earliest complete SSE event terminator in ``buf``."""
-    matches = [
-        (idx, len(terminator))
-        for terminator in _SSE_EVENT_TERMINATORS
-        if (idx := buf.find(terminator)) != -1
-    ]
-    if not matches:
-        return None
-    return min(matches, key=lambda match: match[0])
+    return sse_byte_buffer_policy.find_sse_event_terminator(buf)
 
 
 _SSE_EVENT_LINE_PREFIX = b"event:"
@@ -623,36 +614,7 @@ def parse_sse_events_from_byte_buffer(
     ``decode("utf-8", errors="ignore")`` on a partial buffer; UTF-8
     multi-byte characters split across TCP reads will corrupt content.
     """
-    events: list[tuple[str | None, str]] = []
-    while True:
-        terminator_match = _find_sse_event_terminator(buf)
-        if terminator_match is None:
-            break
-        idx, terminator_len = terminator_match
-        event_bytes = bytes(buf[:idx])
-        # Drain the event + the trailing terminator from the buffer.
-        del buf[: idx + terminator_len]
-        # Decoding the COMPLETE event must succeed. If it doesn't, the
-        # upstream emitted invalid UTF-8 mid-stream — surface loudly.
-        event_text = event_bytes.decode("utf-8")
-        event_name: str | None = None
-        data_lines: list[str] = []
-        for line in event_text.splitlines():
-            if not line:
-                continue
-            # SSE comment line — ignored per spec.
-            if line.startswith(":"):
-                continue
-            if line.startswith("event:"):
-                event_name = line[len("event:") :].lstrip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:") :].lstrip())
-        # Per SSE spec, multiple `data:` lines join with newline. We
-        # preserve that here even though OpenAI/Anthropic emit one
-        # `data:` per event.
-        if data_lines:
-            events.append((event_name, "\n".join(data_lines)))
-    return events
+    return sse_byte_buffer_policy.parse_sse_events_from_byte_buffer(buf)
 
 
 # Maximum message array length (prevents DoS from deeply nested payloads)
