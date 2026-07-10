@@ -37,6 +37,15 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.tool_injection_policy import (
+    TOOL_INJECTION_STICKY_DEFAULT,
+    TOOL_INJECTION_STICKY_ENV,
+    TOOL_TRACKER_MAX_SESSIONS_DEFAULT,
+    TOOL_TRACKER_MAX_SESSIONS_ENV,
+    ToolInjectionStickyMode,
+    resolve_tool_injection_sticky_mode,
+    resolve_tool_tracker_max_sessions,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -1936,12 +1945,11 @@ def log_beta_header_merge(
 # silent fallback. It exists for diagnostic shadow tracing / emergency
 # rollback only.
 
-_TOOL_INJECTION_STICKY_ENV = "HEADROOM_TOOL_INJECTION_STICKY"
-ToolInjectionStickyMode = Literal["enabled", "disabled"]
-_TOOL_INJECTION_STICKY_DEFAULT: ToolInjectionStickyMode = "enabled"
+_TOOL_INJECTION_STICKY_ENV = TOOL_INJECTION_STICKY_ENV
+_TOOL_INJECTION_STICKY_DEFAULT = TOOL_INJECTION_STICKY_DEFAULT
 
-_TOOL_TRACKER_MAX_SESSIONS_ENV = "HEADROOM_TOOL_TRACKER_MAX_SESSIONS"
-_TOOL_TRACKER_MAX_SESSIONS_DEFAULT = 1000
+_TOOL_TRACKER_MAX_SESSIONS_ENV = TOOL_TRACKER_MAX_SESSIONS_ENV
+_TOOL_TRACKER_MAX_SESSIONS_DEFAULT = TOOL_TRACKER_MAX_SESSIONS_DEFAULT
 
 
 def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
@@ -1951,30 +1959,12 @@ def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_TOOL_INJECTION_STICKY_ENV, "").strip().lower()
-    if not raw:
-        return _TOOL_INJECTION_STICKY_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(ToolInjectionStickyMode, raw)
-    raise ValueError(
-        f"Invalid {_TOOL_INJECTION_STICKY_ENV}={raw!r}; expected 'enabled' or 'disabled'"
-    )
+    return resolve_tool_injection_sticky_mode(os.environ.get(_TOOL_INJECTION_STICKY_ENV))
 
 
 def get_tool_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionToolTracker` (sessions cap)."""
-    raw = os.environ.get(_TOOL_TRACKER_MAX_SESSIONS_ENV, "").strip()
-    if not raw:
-        return _TOOL_TRACKER_MAX_SESSIONS_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid {_TOOL_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"Invalid {_TOOL_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int")
-    return value
+    return resolve_tool_tracker_max_sessions(os.environ.get(_TOOL_TRACKER_MAX_SESSIONS_ENV))
 
 
 def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> bytes:
