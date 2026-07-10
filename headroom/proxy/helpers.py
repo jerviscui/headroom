@@ -37,6 +37,10 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.ccr_golden_policy import (
+    create_fresh_ccr_tool_definition,
+    replay_golden_ccr_tool_definition,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -2624,7 +2628,7 @@ def apply_session_sticky_ccr_tool(
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_ccr_tool_definition
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
@@ -2658,14 +2662,13 @@ def apply_session_sticky_ccr_tool(
                 request_id=request_id,
             )
             return tools_out, False
-        tool_def = create_ccr_tool_definition(provider)
-        canonical = serialize_tool_definition_canonical(tool_def)
-        tools_out.append(tool_def)
+        replay = create_fresh_ccr_tool_definition(provider)
+        tools_out.append(replay.tool_definition)
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
             decision="inject_first_time",
-            tool_definition_bytes_count=len(canonical),
+            tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
         return tools_out, True
@@ -2682,13 +2685,13 @@ def apply_session_sticky_ccr_tool(
         golden = tracker.get_golden_tool_bytes(provider, session_id)
         if golden is not None:
             try:
-                tool_def = json.loads(golden.decode("utf-8"))
-                tools_out.append(tool_def)
+                replay = replay_golden_ccr_tool_definition(golden)
+                tools_out.append(replay.tool_definition)
                 log_tool_injection_decision(
                     provider=provider,
                     session_id=session_id,
                     decision="inject_sticky_replay",
-                    tool_definition_bytes_count=len(golden),
+                    tool_definition_bytes_count=len(replay.canonical_bytes),
                     request_id=request_id,
                 )
                 return tools_out, True
@@ -2702,15 +2705,14 @@ def apply_session_sticky_ccr_tool(
                 # Fall through to fresh creation below
         # Tracker says "done CCR" but has no golden bytes (or they were corrupt). Pin
         # them now so future turns are stable.
-        tool_def = create_ccr_tool_definition(provider)
-        canonical = serialize_tool_definition_canonical(tool_def)
-        tracker.record_ccr_done(provider, session_id, canonical)
-        tools_out.append(tool_def)
+        replay = create_fresh_ccr_tool_definition(provider)
+        tracker.record_ccr_done(provider, session_id, replay.canonical_bytes)
+        tools_out.append(replay.tool_definition)
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
             decision="inject_sticky_replay",
-            tool_definition_bytes_count=len(canonical),
+            tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
         return tools_out, True
@@ -2726,15 +2728,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    tool_def = create_ccr_tool_definition(provider)
-    canonical = serialize_tool_definition_canonical(tool_def)
-    tracker.record_ccr_done(provider, session_id, canonical)
-    tools_out.append(tool_def)
+    replay = create_fresh_ccr_tool_definition(provider)
+    tracker.record_ccr_done(provider, session_id, replay.canonical_bytes)
+    tools_out.append(replay.tool_definition)
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
         decision="inject_first_time",
-        tool_definition_bytes_count=len(canonical),
+        tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )
     return tools_out, True
