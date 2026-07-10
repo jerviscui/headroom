@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.proxy import diagnostic_decode_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -595,16 +596,7 @@ def safe_decode_for_logging(raw: bytes, *, max_bytes: int | None = None) -> str:
 
     Use ``parse_sse_events_from_byte_buffer`` for SSE parsing instead.
     """
-    blob = raw[:max_bytes] if max_bytes is not None else raw
-    # Decode incrementally and represent any invalid bytes as the
-    # Unicode replacement character (�). Implemented via the
-    # `codecs` incremental decoder so we never reach for the
-    # forbidden `errors="ignore"`/`errors="replace"` keyword in the
-    # SSE-bearing modules.
-    import codecs as _codecs
-
-    decoder = _codecs.getincrementaldecoder("utf-8")(errors="replace")
-    return decoder.decode(bytes(blob), final=True)
+    return diagnostic_decode_policy.safe_decode_for_logging(raw, max_bytes=max_bytes)
 
 
 def parse_sse_events_from_byte_buffer(
