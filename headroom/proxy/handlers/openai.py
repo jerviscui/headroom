@@ -55,6 +55,9 @@ from headroom.providers.codex.responses import (
     has_chatgpt_account_header,
 )
 from headroom.providers.codex.runtime import (
+    decode_openai_bearer_payload,
+)
+from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
 from headroom.providers.copilot import model_prefers_responses_api
@@ -96,6 +99,7 @@ _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
+_decode_openai_bearer_payload = decode_openai_bearer_payload
 
 
 def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
