@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.proxy import memory_injection_mode_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -236,9 +237,9 @@ def capture_codex_wire_debug(
 # Configurable via HEADROOM_MEMORY_INJECTION_MODE env var. There is no
 # "system_prompt" option — that path is permanently retired by I2 (cache hot
 # zone never modified). See REALIGNMENT/02-architecture.md §2.2.
-_MEMORY_INJECTION_MODE_ENV = "HEADROOM_MEMORY_INJECTION_MODE"
-_MEMORY_INJECTION_MODE_DEFAULT: Literal["live_zone_tail", "disabled"] = "live_zone_tail"
-MemoryInjectionMode = Literal["live_zone_tail", "disabled"]
+_MEMORY_INJECTION_MODE_ENV = memory_injection_mode_policy.MEMORY_INJECTION_MODE_ENV
+_MEMORY_INJECTION_MODE_DEFAULT = memory_injection_mode_policy.MEMORY_INJECTION_MODE_DEFAULT
+MemoryInjectionMode = memory_injection_mode_policy.MemoryInjectionMode
 
 
 def get_memory_injection_mode() -> MemoryInjectionMode:
@@ -247,13 +248,8 @@ def get_memory_injection_mode() -> MemoryInjectionMode:
     Read at request time so the env var can be flipped without restart for
     smoke tests. Unknown values are rejected loudly (no silent fallback).
     """
-    raw = os.environ.get(_MEMORY_INJECTION_MODE_ENV, "").strip().lower()
-    if not raw:
-        return _MEMORY_INJECTION_MODE_DEFAULT
-    if raw in ("live_zone_tail", "disabled"):
-        return cast(MemoryInjectionMode, raw)
-    raise ValueError(
-        f"Invalid {_MEMORY_INJECTION_MODE_ENV}={raw!r}; expected 'live_zone_tail' or 'disabled'"
+    return memory_injection_mode_policy.resolve_memory_injection_mode(
+        os.environ.get(_MEMORY_INJECTION_MODE_ENV)
     )
 
 
