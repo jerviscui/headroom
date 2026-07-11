@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import Response
+from starlette.requests import ClientDisconnect
 
 logger = logging.getLogger("headroom.providers.openai.responses")
 
@@ -72,7 +73,11 @@ async def handle_openai_responses_subpath(
 ) -> Response:
     """Forward a Responses API subpath request to the configured OpenAI upstream."""
     url = openai_responses_subpath_url(api_base_url, sub_path, request.url.query)
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug("Client disconnected during body read for codex responses passthrough")
+        return Response(status_code=204)
     try:
         resp = await http_client.request(
             request.method,

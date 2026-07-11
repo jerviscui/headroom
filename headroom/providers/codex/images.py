@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from fastapi import Request
 from fastapi.responses import Response
+from starlette.requests import ClientDisconnect
 
 from headroom.proxy.helpers import _strip_internal_headers
 
@@ -85,7 +86,11 @@ async def handle_chatgpt_codex_images(
     if not is_chatgpt_auth:
         return None
 
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug("Client disconnected during body read for passthrough")
+        return Response(status_code=204)
     try:
         if http_client is None:
             raise RuntimeError("No HTTP client configured for Codex image forwarding")
