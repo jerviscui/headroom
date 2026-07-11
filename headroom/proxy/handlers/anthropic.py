@@ -3411,7 +3411,10 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages,
+                        model=model,
+                        context_limit=context_limit,
+                        frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,
@@ -3632,7 +3635,13 @@ class AnthropicHandlerMixin:
             request_id=None,
         )
 
-        body = await request.body()
+        from starlette.requests import ClientDisconnect
+
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug("Client disconnected during body read for anthropic batch passthrough")
+            return Response(status_code=204)
 
         response = await self.http_client.request(  # type: ignore[union-attr]
             method=request.method,
