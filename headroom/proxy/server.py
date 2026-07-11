@@ -163,6 +163,7 @@ from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -2020,22 +2021,7 @@ def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
     )
 
 
-def _tool_schema_saved_from_tags(tags: object) -> int:
-    """Tool-definition tokens Headroom kept out of context for one request by
-    deferring heavy tool schemas: the native tool-search injection
-    (``tool_search_deferred_tokens``) plus any registered turn-hook tools
-    rewrite (``turn_hook_tools_saved_tokens``). Both tags are set only on the
-    path where Headroom performed the deferral, so a client that already had
-    tool search enabled (e.g. Claude Code / Codex) contributes zero here."""
-    if not isinstance(tags, dict):
-        return 0
-    total = 0
-    for key in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-        try:
-            total += int(tags.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            continue
-    return total
+_tool_schema_saved_from_tags = tool_schema_saved_from_tags
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -2320,6 +2306,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 url=_upstream_check_cache["url"],
                 error=_upstream_check_cache["error"],
             ),
+            "kompress": _component_health(
+                enabled=not config.disable_kompress,
+                ready=proxy.warmup.kompress.status == "loaded",
+                backend=proxy.warmup.kompress.info.get("backend", None),
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:
@@ -2418,7 +2409,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
-        ready = all(check["ready"] for check in checks.values())
+        # Kompress is an optional soft component: model downloads lazily on
+        # first use, so "not ready" (cold cache) must not degrade overall health.
+        ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
