@@ -10,7 +10,8 @@ use std::net::SocketAddr;
 
 use aws_credential_types::Credentials;
 use common::{install_static_token_source, start_proxy_with_state};
-use headroom_simulators::{build_app as build_simulator_app, Simulator, SimulatorConfig};
+use headroom_simulators::config::{ConfiguredResponse, SimulatorConfig, StubRule};
+use headroom_simulators::{build_app as build_simulator_app, Simulator};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use url::Url;
@@ -41,7 +42,11 @@ impl SimulatorHandle {
 }
 
 async fn start_simulator() -> SimulatorHandle {
-    let app = build_simulator_app(Simulator::new(SimulatorConfig::default())).into_make_service();
+    start_simulator_with_config(SimulatorConfig::default()).await
+}
+
+async fn start_simulator_with_config(config: SimulatorConfig) -> SimulatorHandle {
+    let app = build_simulator_app(Simulator::new(config)).into_make_service();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind simulator");
@@ -89,6 +94,24 @@ async fn start_simulator_proxy(simulator_url: &str) -> common::ProxyHandle {
     .await
 }
 
+async fn start_simulator_proxy_without_bedrock_credentials(
+    simulator_url: &str,
+) -> common::ProxyHandle {
+    let bedrock_endpoint: Url = simulator_url.parse().expect("simulator url");
+    start_proxy_with_state(
+        simulator_url,
+        |c| {
+            c.compression = false;
+            c.bedrock_endpoint = Some(bedrock_endpoint);
+            c.enable_bedrock_native = true;
+            c.enable_responses_streaming = true;
+            c.enable_conversations_passthrough = true;
+        },
+        |s| install_static_token_source(s, TEST_BEARER),
+    )
+    .await
+}
+
 fn assert_simulator_header(resp: &reqwest::Response) {
     assert_eq!(
         resp.headers()
@@ -97,6 +120,41 @@ fn assert_simulator_header(resp: &reqwest::Response) {
         Some("true"),
         "response must have come from the simulator"
     );
+}
+
+fn assert_not_simulator_response(resp: &reqwest::Response) {
+    assert!(
+        resp.headers().get("x-headroom-simulator").is_none(),
+        "proxy-owned preflight errors must not be simulator responses"
+    );
+}
+
+fn json_error_stub(
+    name: &str,
+    path: &str,
+    body_contains: &str,
+    status: u16,
+    error_type: &str,
+) -> StubRule {
+    StubRule {
+        name: name.to_string(),
+        method: Some("POST".to_string()),
+        path: path.to_string(),
+        body_contains: Some(body_contains.to_string()),
+        body_json_pointer: None,
+        response: ConfiguredResponse {
+            status,
+            headers: [("x-simulator-error-path".to_string(), name.to_string())].into(),
+            json: Some(json!({
+                "error": {
+                    "type": error_type,
+                    "message": format!("simulated {name}")
+                }
+            })),
+            body: None,
+            sse: vec![],
+        },
+    }
 }
 
 async fn json_post(
@@ -387,6 +445,132 @@ async fn vertex_raw_and_stream_predict_use_simulator() {
     let text = stream.text().await.unwrap();
     assert!(text.contains("event: message_start"));
     assert!(text.contains("simulated anthropic stream"));
+
+    proxy.shutdown().await;
+    simulator.shutdown().await;
+}
+
+#[tokio::test]
+async fn simulator_provider_errors_flow_through_headroom() {
+    let vertex_path = format!(
+        "/v1beta1/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}/publishers/anthropic/models/{VERTEX_MODEL}:rawPredict"
+    );
+    let simulator = start_simulator_with_config(SimulatorConfig {
+        stubs: vec![
+            json_error_stub(
+                "openai-rate-limit",
+                "/v1/chat/completions",
+                "rate-limit-me",
+                429,
+                "rate_limit_error",
+            ),
+            json_error_stub(
+                "anthropic-overloaded",
+                "/v1/messages",
+                "server-error-me",
+                529,
+                "overloaded_error",
+            ),
+            json_error_stub(
+                "bedrock-upstream-fault",
+                &format!("/model/{BEDROCK_MODEL}/invoke"),
+                "bedrock-fail",
+                502,
+                "bedrock_upstream_error",
+            ),
+            json_error_stub(
+                "vertex-upstream-fault",
+                &vertex_path,
+                "vertex-fail",
+                503,
+                "vertex_upstream_error",
+            ),
+        ],
+    })
+    .await;
+    let proxy = start_simulator_proxy(&simulator.url()).await;
+    let client = reqwest::Client::new();
+
+    let cases = [
+        (
+            format!("{}/v1/chat/completions", proxy.url()),
+            json!({"model":"gpt-4o","messages":[{"role":"user","content":"rate-limit-me"}]}),
+            429,
+            "rate_limit_error",
+        ),
+        (
+            format!("{}/v1/messages", proxy.url()),
+            json!({"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{"role":"user","content":"server-error-me"}]}),
+            529,
+            "overloaded_error",
+        ),
+        (
+            format!("{}/model/{BEDROCK_MODEL}/invoke", proxy.url()),
+            json!({"anthropic_version":"bedrock-2023-05-31","max_tokens":32,"messages":[{"role":"user","content":"bedrock-fail"}]}),
+            502,
+            "bedrock_upstream_error",
+        ),
+        (
+            format!("{}{}", proxy.url(), vertex_path),
+            json!({"anthropic_version":"vertex-2023-10-16","max_tokens":32,"messages":[{"role":"user","content":"vertex-fail"}]}),
+            503,
+            "vertex_upstream_error",
+        ),
+    ];
+
+    for (url, body, expected_status, expected_type) in cases {
+        let resp = json_post(&client, url, body).await;
+        assert_eq!(resp.status().as_u16(), expected_status);
+        assert_simulator_header(&resp);
+        assert!(
+            resp.headers().get("x-simulator-error-path").is_some(),
+            "configured simulator error path should survive Headroom response filtering"
+        );
+        let error_body: Value = resp.json().await.unwrap();
+        assert_eq!(error_body["error"]["type"], json!(expected_type));
+    }
+
+    proxy.shutdown().await;
+    simulator.shutdown().await;
+}
+
+#[tokio::test]
+async fn headroom_preflight_errors_stop_before_simulator_fallback() {
+    let simulator = start_simulator().await;
+    let proxy = start_simulator_proxy_without_bedrock_credentials(&simulator.url()).await;
+    let client = reqwest::Client::new();
+
+    let bedrock = json_post(
+        &client,
+        format!("{}/model/{BEDROCK_MODEL}/invoke", proxy.url()),
+        json!({
+            "anthropic_version":"bedrock-2023-05-31",
+            "max_tokens":32,
+            "messages":[{"role":"user","content":"must not be forwarded unsigned"}]
+        }),
+    )
+    .await;
+    assert_eq!(bedrock.status(), 500);
+    assert_not_simulator_response(&bedrock);
+    let bedrock_body: Value = bedrock.json().await.unwrap();
+    assert_eq!(
+        bedrock_body["error"]["type"],
+        json!("bedrock_credentials_missing")
+    );
+
+    let vertex = json_post(
+        &client,
+        format!(
+            "{}/v1beta1/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}/publishers/anthropic/models/{VERTEX_MODEL}:rawPredict",
+            proxy.url()
+        ),
+        json!({"model":"must-not-be-in-vertex-envelope","messages":[]}),
+    )
+    .await;
+    assert_eq!(vertex.status(), 400);
+    assert_not_simulator_response(&vertex);
+    let vertex_body = vertex.text().await.unwrap();
+    assert_eq!(vertex_body, "vertex envelope invalid");
 
     proxy.shutdown().await;
     simulator.shutdown().await;
