@@ -38,7 +38,6 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
-from headroom.proxy.tool_name_policy import extract_tool_name
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -48,6 +47,7 @@ from headroom.proxy.tool_injection_config import (
 from headroom.proxy.tool_injection_config import (
     get_tool_tracker_max_sessions as _get_tool_tracker_max_sessions,
 )
+from headroom.proxy.tool_name_policy import extract_tool_name
 
 if TYPE_CHECKING:
     import httpx
