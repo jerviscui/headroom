@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from headroom.proxy.helpers import serialize_body_canonical
+from headroom.proxy.body_forwarding import serialize_body_canonical
 from headroom.proxy.tool_definition_serialization import serialize_tool_definition_canonical
 
 
