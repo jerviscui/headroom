@@ -14,6 +14,7 @@ from fastapi.responses import Response
 from headroom.proxy.handlers.openai import (
     _custom_base_passthrough_telemetry,
     _resolve_codex_routing_headers,
+    _sanitize_forwarded_response_headers,
 )
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -394,7 +395,13 @@ async def _handle_chatgpt_model_metadata(
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
-    body = await request.body()
+    from starlette.requests import ClientDisconnect
+
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug("Client disconnected during body read for passthrough")
+        return Response(status_code=204)
     try:
         assert proxy.http_client is not None
         resp = await proxy.http_client.request(
@@ -434,7 +441,13 @@ async def _handle_chatgpt_codex_images(
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
-    body = await request.body()
+    from starlette.requests import ClientDisconnect
+
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug("Client disconnected during body read for passthrough")
+        return Response(status_code=204)
     try:
         client = getattr(proxy, "http_client_h1", None) or getattr(proxy, "http_client", None)
         if client is None:
@@ -447,9 +460,7 @@ async def _handle_chatgpt_codex_images(
             content=body,
             timeout=120.0,
         )
-        response_headers = dict(resp.headers)
-        response_headers.pop("content-encoding", None)
-        response_headers.pop("content-length", None)
+        response_headers = _sanitize_forwarded_response_headers(resp.headers)
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -595,7 +606,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if request.url.query:
             url = f"{url}?{request.url.query}"
 
-        body = await request.body()
+        from starlette.requests import ClientDisconnect
+
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug("Client disconnected during body read for codex responses passthrough")
+            return Response(status_code=204)
         try:
             assert proxy.http_client is not None
             resp = await proxy.http_client.request(
