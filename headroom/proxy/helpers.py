@@ -36,7 +36,6 @@ from headroom.proxy.body_forwarding import (
 from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
-from headroom.proxy.body_forwarding import serialize_body_canonical
 from headroom.proxy.tool_definition_serialization import (
     serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
