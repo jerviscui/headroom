@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
-from headroom.proxy import request_limit_policy
 from headroom.proxy.beta_header_policy import (
     BETA_HEADER_STICKY_DEFAULT,
     BETA_HEADER_STICKY_ENV,
@@ -34,6 +33,7 @@ from headroom.proxy.beta_header_policy import (
     resolve_beta_header_sticky_mode,
     resolve_beta_tracker_max_sessions,
 )
+from headroom.proxy import request_limit_policy, wire_debug_redaction_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -48,6 +48,14 @@ from headroom.proxy.body_forwarding import (
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.internal_header_policy import (
+    INTERNAL_HEADER_PREFIX,
+    STRIP_INTERNAL_HEADERS_DEFAULT,
+    STRIP_INTERNAL_HEADERS_ENV,
+    StripInternalHeadersMode,
+    resolve_strip_internal_headers_mode,
+    strip_internal_headers,
+)
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -66,24 +74,8 @@ logger = logging.getLogger("headroom.proxy")
 
 _CODEX_WIRE_DEBUG_ENV = "HEADROOM_CODEX_WIRE_DEBUG"
 _CODEX_WIRE_DEBUG_DIR_ENV = "HEADROOM_CODEX_WIRE_DEBUG_DIR"
-_CODEX_WIRE_REDACTED = "[REDACTED]"
-_CODEX_WIRE_SECRET_KEYS = (
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "api-key",
-    "x-api-key",
-    "openai-api-key",
-    "anthropic-api-key",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "bearer",
-    "password",
-    "secret",
-    "token",
-    "credential",
-)
+_CODEX_WIRE_REDACTED = wire_debug_redaction_policy.WIRE_DEBUG_REDACTED
+_CODEX_WIRE_SECRET_KEYS = wire_debug_redaction_policy.WIRE_DEBUG_SECRET_KEYS
 
 
 def codex_wire_debug_enabled() -> bool:
@@ -105,33 +97,16 @@ def _codex_wire_debug_dir() -> Path:
 
 
 def _should_redact_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    if normalized in {marker.replace("-", "_") for marker in _CODEX_WIRE_SECRET_KEYS}:
-        return True
-    return (
-        normalized.endswith("_api_key")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_password")
-        or normalized.endswith("_access_token")
-        or normalized.endswith("_refresh_token")
-    )
+    return wire_debug_redaction_policy.should_redact_key(key)
 
 
 def _redact_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            k: (_CODEX_WIRE_REDACTED if _should_redact_key(str(k)) else _redact_value(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value(item) for item in value]
-    return value
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def redact_for_wire_debug(value: Any) -> Any:
     """Redact obvious secrets while preserving request/response shape."""
-
-    return _redact_value(value)
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def _safe_event_name(event: str) -> str:
@@ -1516,16 +1491,9 @@ def is_anthropic_auth(headers: dict[str, str]) -> bool:
 # tell its client about its own work. This helper only filters
 # request-side headers.
 
-_INTERNAL_HEADER_PREFIX = "x-headroom-"
-
-# Operator opt-in env var. ``enabled`` (default) strips internal
-# ``x-headroom-*`` headers from every upstream-bound forwarder.
-# ``disabled`` is an explicit operator opt-in for diagnostic shadow
-# tracing — NOT a fallback. Per realignment build constraint #4 the
-# behaviour is loud, configurable, and never silent.
-_STRIP_INTERNAL_HEADERS_ENV = "HEADROOM_STRIP_INTERNAL_HEADERS"
-StripInternalHeadersMode = Literal["enabled", "disabled"]
-_STRIP_INTERNAL_HEADERS_DEFAULT: StripInternalHeadersMode = "enabled"
+_INTERNAL_HEADER_PREFIX = INTERNAL_HEADER_PREFIX
+_STRIP_INTERNAL_HEADERS_ENV = STRIP_INTERNAL_HEADERS_ENV
+_STRIP_INTERNAL_HEADERS_DEFAULT = STRIP_INTERNAL_HEADERS_DEFAULT
 
 
 def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
@@ -1535,14 +1503,7 @@ def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_STRIP_INTERNAL_HEADERS_ENV, "").strip().lower()
-    if not raw:
-        return _STRIP_INTERNAL_HEADERS_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(StripInternalHeadersMode, raw)
-    raise ValueError(
-        f"Invalid {_STRIP_INTERNAL_HEADERS_ENV}={raw!r}; expected 'enabled' or 'disabled'"
-    )
+    return resolve_strip_internal_headers_mode(os.environ.get(_STRIP_INTERNAL_HEADERS_ENV))
 
 
 def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -1558,11 +1519,7 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     is set, returns a shallow copy unchanged. That mode is for diagnostic
     shadow tracing only and is documented as a per-deploy choice.
     """
-    mode = get_strip_internal_headers_mode()
-    if mode == "disabled":
-        # Always return a copy so callers can mutate without surprise.
-        return dict(headers)
-    return {k: v for k, v in headers.items() if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)}
+    return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
 def log_outbound_headers(
