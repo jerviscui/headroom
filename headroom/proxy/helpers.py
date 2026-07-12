@@ -26,6 +26,7 @@ from headroom import paths as _paths
 from headroom._subprocess import run
 from headroom.proxy import (
     diagnostic_decode_policy,
+    query_log_policy,
     request_limit_policy,
     sse_byte_buffer_policy,
     wire_debug_format_policy,
@@ -257,8 +258,7 @@ def hash_query_for_log(query: str) -> str:
 
     Uses BLAKE2b truncated to 16 hex chars. Never logs the raw query content.
     """
-    h = hashlib.blake2b(query.encode("utf-8", errors="replace"), digest_size=8)
-    return h.hexdigest()
+    return query_log_policy.hash_query_for_log(query)
 
 
 def extract_tags(headers: Any) -> dict[str, str]:
