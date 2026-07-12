@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
-from headroom.proxy import request_limit_policy, sse_byte_buffer_policy
+from headroom.proxy import request_limit_policy, sse_byte_buffer_policy, wire_debug_redaction_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -38,6 +38,16 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.tool_injection_config import (
+    ToolInjectionStickyMode,
+)
+from headroom.proxy.tool_injection_config import (
+    get_tool_injection_sticky_mode as _get_tool_injection_sticky_mode,
+)
+from headroom.proxy.tool_injection_config import (
+    get_tool_tracker_max_sessions as _get_tool_tracker_max_sessions,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -47,24 +57,8 @@ logger = logging.getLogger("headroom.proxy")
 
 _CODEX_WIRE_DEBUG_ENV = "HEADROOM_CODEX_WIRE_DEBUG"
 _CODEX_WIRE_DEBUG_DIR_ENV = "HEADROOM_CODEX_WIRE_DEBUG_DIR"
-_CODEX_WIRE_REDACTED = "[REDACTED]"
-_CODEX_WIRE_SECRET_KEYS = (
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "api-key",
-    "x-api-key",
-    "openai-api-key",
-    "anthropic-api-key",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "bearer",
-    "password",
-    "secret",
-    "token",
-    "credential",
-)
+_CODEX_WIRE_REDACTED = wire_debug_redaction_policy.WIRE_DEBUG_REDACTED
+_CODEX_WIRE_SECRET_KEYS = wire_debug_redaction_policy.WIRE_DEBUG_SECRET_KEYS
 
 
 def codex_wire_debug_enabled() -> bool:
@@ -86,33 +80,16 @@ def _codex_wire_debug_dir() -> Path:
 
 
 def _should_redact_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    if normalized in {marker.replace("-", "_") for marker in _CODEX_WIRE_SECRET_KEYS}:
-        return True
-    return (
-        normalized.endswith("_api_key")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_password")
-        or normalized.endswith("_access_token")
-        or normalized.endswith("_refresh_token")
-    )
+    return wire_debug_redaction_policy.should_redact_key(key)
 
 
 def _redact_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            k: (_CODEX_WIRE_REDACTED if _should_redact_key(str(k)) else _redact_value(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value(item) for item in value]
-    return value
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def redact_for_wire_debug(value: Any) -> Any:
     """Redact obvious secrets while preserving request/response shape."""
-
-    return _redact_value(value)
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def _safe_event_name(event: str) -> str:
@@ -1884,13 +1861,6 @@ def log_beta_header_merge(
 # silent fallback. It exists for diagnostic shadow tracing / emergency
 # rollback only.
 
-_TOOL_INJECTION_STICKY_ENV = "HEADROOM_TOOL_INJECTION_STICKY"
-ToolInjectionStickyMode = Literal["enabled", "disabled"]
-_TOOL_INJECTION_STICKY_DEFAULT: ToolInjectionStickyMode = "enabled"
-
-_TOOL_TRACKER_MAX_SESSIONS_ENV = "HEADROOM_TOOL_TRACKER_MAX_SESSIONS"
-_TOOL_TRACKER_MAX_SESSIONS_DEFAULT = 1000
-
 
 def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     """Return the active memory-tool stickiness mode.
@@ -1899,30 +1869,12 @@ def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_TOOL_INJECTION_STICKY_ENV, "").strip().lower()
-    if not raw:
-        return _TOOL_INJECTION_STICKY_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(ToolInjectionStickyMode, raw)
-    raise ValueError(
-        f"Invalid {_TOOL_INJECTION_STICKY_ENV}={raw!r}; expected 'enabled' or 'disabled'"
-    )
+    return _get_tool_injection_sticky_mode()
 
 
 def get_tool_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionToolTracker` (sessions cap)."""
-    raw = os.environ.get(_TOOL_TRACKER_MAX_SESSIONS_ENV, "").strip()
-    if not raw:
-        return _TOOL_TRACKER_MAX_SESSIONS_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid {_TOOL_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"Invalid {_TOOL_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int")
-    return value
+    return _get_tool_tracker_max_sessions()
 
 
 def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> bytes:
@@ -2352,105 +2304,13 @@ def apply_session_sticky_memory_tools(
 # tool list bytes stay byte-stable across turns once injected.
 
 
-class SessionCcrTracker:
-    """Bounded LRU tracker recording per-(provider, session_id) CCR state.
-
-    Two pieces of state per session:
-
-      * ``has_done_ccr``: True once the proxy observed any CCR
-        compression marker in the messages of a request. Once True, it
-        never flips back to False (the prompt cache anchored on the
-        previous turn's tool list demands the tool stays present).
-      * ``golden_tool_bytes``: canonical serialization of the
-        ``headroom_retrieve`` tool definition recorded the first time
-        the tracker injected it. Subsequent turns replay these bytes
-        verbatim.
-
-    Bounded by ``max_sessions`` via ``OrderedDict`` LRU. Mirrors
-    :class:`SessionToolTracker` semantics so the operator's mental model
-    is one tracker pattern, not two.
-    """
+class SessionCcrTracker(_SessionCcrTracker):
+    """Env-aware compatibility wrapper for the pure CCR session tracker."""
 
     def __init__(self, max_sessions: int | None = None) -> None:
         if max_sessions is None:
             max_sessions = get_tool_tracker_max_sessions()
-        if max_sessions <= 0:
-            raise ValueError("max_sessions must be > 0")
-        self._max_sessions = max_sessions
-        self._lock = threading.RLock()
-        # Value is (has_done_ccr, golden_tool_bytes_or_none).
-        self._sessions: OrderedDict[tuple[str, str], tuple[bool, bytes | None]] = OrderedDict()
-
-    @property
-    def active_sessions(self) -> int:
-        with self._lock:
-            return len(self._sessions)
-
-    def _key(self, provider: str, session_id: str) -> tuple[str, str]:
-        return (provider, session_id)
-
-    def has_done_ccr(self, provider: str, session_id: str) -> bool:
-        """Return True iff this session has previously performed CCR."""
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return False
-            self._sessions.move_to_end(self._key(provider, session_id))
-            return entry[0]
-
-    def get_golden_tool_bytes(self, provider: str, session_id: str) -> bytes | None:
-        """Return the recorded golden tool-definition bytes, or None."""
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return None
-            self._sessions.move_to_end(self._key(provider, session_id))
-            return entry[1]
-
-    def record_ccr_done(
-        self,
-        provider: str,
-        session_id: str,
-        golden_tool_bytes: bytes,
-    ) -> None:
-        """Mark the session as having performed CCR and pin the golden bytes.
-
-        First-write wins for ``golden_tool_bytes`` (subsequent calls
-        with the same session keep the original bytes — prevents drift
-        if the canonical serialization changed mid-session). The
-        ``has_done_ccr`` flag is monotonic: once True, never False.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        if not golden_tool_bytes:
-            raise ValueError("golden_tool_bytes must be non-empty")
-        key = self._key(provider, session_id)
-        with self._lock:
-            existing = self._sessions.get(key)
-            if existing is None:
-                self._sessions[key] = (True, golden_tool_bytes)
-            else:
-                # Preserve original golden bytes; just promote the flag.
-                pinned = existing[1] if existing[1] is not None else golden_tool_bytes
-                self._sessions[key] = (True, pinned)
-            self._sessions.move_to_end(key)
-            while len(self._sessions) > self._max_sessions:
-                self._sessions.popitem(last=False)
-
-    def reset(self) -> None:
-        """Clear all session state (test helper)."""
-        with self._lock:
-            self._sessions.clear()
+        super().__init__(max_sessions=max_sessions)
 
 
 # Process-wide singleton.
