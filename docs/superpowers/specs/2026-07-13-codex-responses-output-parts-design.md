@@ -101,12 +101,15 @@ OpenAI handler 仍负责：
 - `MIN_BATCH_BYTES = 512`，与 `OPENAI_RESPONSES_ROUTER_MIN_BYTES` 保持一致并由调用方传入。
 - `MAX_BATCH_BYTES = 2048`，限制单次批次的模型输入和最坏延迟。
 - `MAX_BATCH_UNITS = 16`，避免一个批次包含过多边界。
+- `MAX_BATCH_BYTES` 和 `MAX_BATCH_UNITS` 都是上限，不是开始压缩前必须达到的条件；批次只要合计达到 `MIN_BATCH_BYTES` 就具备执行资格。
 - 单元大小按 `len(text.encode("utf-8", errors="replace"))` 计算，不使用字符数代替字节数。
 - 单个单元达到 512B 时不进入批次，继续走现有单元路径。
 - 小单元按请求中的原始顺序贪心装箱；达到单位数或字节上限后关闭当前批次。
 - 只有 `provider`、`endpoint`、`role`、`cache_zone`、`mutable`、`context`、`question` 和 `bias` 等路由属性兼容的单元才能进入同一批次。
 - 只有原始文本合计达到 512B 的批次才执行压缩。
 - 尾部不足 512B 的小单元保持 `size_floor`，不调用 ContentRouter。
+- 请求结束时必须 flush 当前未满批次：即使只有 4 个单元、合计 600B，也应执行一次批量压缩；如果合计只有 450B，则按 `size_floor` 安全透传。
+- 如果批次先达到 16 个单元但合计仍不足 512B，则这些极小单元整体按 `size_floor` 透传并开始新批次，避免为了少量潜在 token 节省构造过大的标记信封。
 - 批次可以包含不同 `call_id`，但每个 entry 必须保留独立 ID、原槽位和写回结果；任何 ID 丢失、重复或重排都会导致整个批次回退。
 - 已排除工具、`headroom_retrieve` 输出、非 live cache zone、不可变单元及受保护角色不进入批次。
 
