@@ -176,6 +176,55 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert strategy_chain == []
 
 
+def test_openai_responses_adapter_compresses_array_input_text_output():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="custom output summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    metadata = "Chunk ID: abc\nWall time: 1s"
+    long_text = " ".join(f"word{i}" for i in range(180))
+    image_part = {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": metadata},
+                    {"type": "input_text", "text": long_text},
+                    image_part,
+                ],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    output = new_payload["input"][0]["output"]
+    assert output[0]["text"] == metadata
+    assert output[1]["text"] == "custom output summary"
+    assert output[2] == image_part
+    assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
+    assert units_by_category == {"size_floor": 1, "applied": 1}
+    assert strategy_chain == []
+
+
 def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     router = ContentRouter()
     calls = {"count": 0}

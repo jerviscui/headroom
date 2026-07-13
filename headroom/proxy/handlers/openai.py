@@ -1288,27 +1288,45 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
-        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+        def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
             # Only tool-output items are eligible for in-place compression.
             # Message items (user/system/assistant) sit inside the request's
             # cacheable prefix; mutating them busts prefix caching on every
             # subsequent turn. Role-level guards in compression_units.py
             # remain as defense-in-depth.
             type_tag = item.get("type")
-            if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
-                output = item.get("output")
-                if isinstance(output, str):
-                    return output, ("output", None)
-            return None
+            if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                return []
+            output = item.get("output")
+            if isinstance(output, str):
+                return [(output, ("output", None))]
+            if not isinstance(output, list):
+                return []
+            return [
+                (part["text"], ("output_part", index))
+                for index, part in enumerate(output)
+                if isinstance(part, dict)
+                and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)
+            ]
 
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
-        ) -> None:
-            kind, _ = slot
+        ) -> bool:
+            kind, index = slot
             if kind == "output":
                 item["output"] = replacement
+                return True
+            if kind == "output_part" and isinstance(index, int):
+                output = item.get("output")
+                if isinstance(output, list) and 0 <= index < len(output):
+                    part = output[index]
+                    if isinstance(part, dict) and part.get("type") == "input_text":
+                        part["text"] = replacement
+                        return True
+            return False
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
@@ -1421,25 +1439,25 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
-                slot = _slot_text(item)
-                if slot is not None:
-                    text, slot_ref = slot
-                    candidates.append((idx, slot_ref, text))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": True,
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
-                                "item": item,
-                                "text": text,
-                            }
-                        )
+                slots = _slot_texts(item)
+                if slots:
+                    for text, slot_ref in slots:
+                        candidates.append((idx, slot_ref, text))
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": True,
+                                    "item_type": item_type,
+                                    "role": item.get("role"),
+                                    "slot": slot_ref,
+                                    "text_chars": len(text),
+                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                    "text_json_shape": _json_shape(text),
+                                    "item": item,
+                                    "text": text,
+                                }
+                            )
                 else:
                     if debug_enabled:
                         extraction_debug.append(
@@ -1741,12 +1759,12 @@ class OpenAIHandlerMixin:
             target_item = updated_items[item_idx]
             if not isinstance(target_item, dict):
                 continue
-            _set_slot_text(target_item, slot_ref, result.compressed)
-            modified = True
-            tokens_saved_total += result.tokens_saved
-            for transform in result.transforms_applied:
-                if transform not in transforms:
-                    transforms.append(transform)
+            if _set_slot_text(target_item, slot_ref, result.compressed):
+                modified = True
+                tokens_saved_total += result.tokens_saved
+                for transform in result.transforms_applied:
+                    if transform not in transforms:
+                        transforms.append(transform)
         _add_timing("compression_unit_apply_results", apply_started)
 
         # Splice byte/data-lossless folds of excluded tool outputs (grep/log/
@@ -1756,8 +1774,8 @@ class OpenAIHandlerMixin:
             e_target = updated_items[e_idx] if e_idx < len(updated_items) else None
             if not isinstance(e_target, dict):
                 continue
-            _set_slot_text(e_target, e_slot, e_folded)
-            modified = True
+            if _set_slot_text(e_target, e_slot, e_folded):
+                modified = True
             e_before = tokenizer.count_text(e_orig)
             e_saved = e_before - tokenizer.count_text(e_folded)
             if e_saved > 0:
