@@ -120,6 +120,24 @@ def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
     body.pop("max_tokens", None)
 
 
+def _apply_stream_usage_option(body: dict[str, Any]) -> None:
+    """Ask the upstream for a usage chunk (for token counting) in-place, without
+    overriding an explicit client ``stream_options.include_usage``.
+
+    Forcing ``include_usage`` on a client that passed ``false`` (or that set the
+    dict without the key) makes the upstream append a trailing usage-only chunk
+    (``choices: []``) the client never asked for; the common
+    ``chunk.choices[0].delta`` pattern then raises ``IndexError``. So only inject
+    the option when the client left the choice open: no ``stream_options`` at all,
+    or a ``stream_options`` dict that does not mention ``include_usage``.
+    """
+    stream_options = body.get("stream_options")
+    if stream_options is None:
+        body["stream_options"] = {"include_usage": True}
+    elif isinstance(stream_options, dict) and "include_usage" not in stream_options:
+        stream_options["include_usage"] = True
+
+
 def _header_get(headers: dict[str, str], name: str) -> str | None:
     """Case-insensitive header lookup for plain dicts."""
     lowered = name.lower()
@@ -3160,12 +3178,10 @@ class OpenAIHandlerMixin:
 
         try:
             if stream:
-                # Inject stream_options to get usage stats in streaming response
-                # This allows accurate token counting instead of byte-based estimation
-                if "stream_options" not in body:
-                    body["stream_options"] = {"include_usage": True}
-                elif isinstance(body.get("stream_options"), dict):
-                    body["stream_options"]["include_usage"] = True
+                # Request usage stats for accurate token counting instead of
+                # byte-based estimation — without overriding an explicit client
+                # choice (see _apply_stream_usage_option).
+                _apply_stream_usage_option(body)
 
                 self.pipeline_extensions.emit(
                     PipelineStage.POST_SEND,
