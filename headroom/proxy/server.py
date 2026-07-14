@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -2036,6 +2037,32 @@ def _request_is_loopback(request: Request) -> bool:
     return peer_is_trusted_gateway(client_host, load_trusted_gateway_cidrs())
 
 
+def _request_can_view_dashboard_metadata(
+    request: Request,
+    trusted_dashboard_client_cidrs: tuple[
+        ipaddress.IPv4Network | ipaddress.IPv6Network, ...
+    ],
+) -> bool:
+    """Authorize sensitive ``/stats`` metadata without widening admin access."""
+    if _request_is_loopback(request):
+        return True
+
+    from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
+    from headroom.proxy.loopback_guard import is_ip_literal_host_header
+
+    try:
+        host_header = request.headers.get("host")
+    except AttributeError:
+        return False
+    if not is_ip_literal_host_header(host_header):
+        return False
+
+    return peer_is_trusted_gateway(
+        resolve_client_ip(request),
+        trusted_dashboard_client_cidrs,
+    )
+
+
 _is_known_websocket_callback_failure = is_known_websocket_callback_failure
 
 
@@ -2046,6 +2073,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
         raise ImportError("FastAPI required. Install: pip install fastapi uvicorn httpx")
+
+    from headroom.proxy.forwarded_headers import load_trusted_dashboard_client_cidrs
+
+    # Parse once at startup so invalid operator configuration fails loudly.
+    trusted_dashboard_client_cidrs = load_trusted_dashboard_client_cidrs()
 
     from contextlib import asynccontextmanager
 
@@ -3659,7 +3691,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         only for loopback callers — the local dashboard. Network callers still
         get the aggregate counters but never the per-request metadata.
         """
-        include_sensitive = _request_is_loopback(request)
+        include_sensitive = _request_can_view_dashboard_metadata(
+            request,
+            trusted_dashboard_client_cidrs,
+        )
         if cached:
             payload = dict(await _get_cached_stats_payload())
             if include_sensitive:
