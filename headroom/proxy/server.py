@@ -3071,7 +3071,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
         recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
         dashboard_recent_requests = []
-        for log in recent_request_logs:
+        for log in reversed(recent_request_logs):
             token_accounting_status = _recent_request_token_accounting_status(log)
             dashboard_recent_requests.append(
                 {
@@ -3099,7 +3099,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
                 }
             )
-        dashboard_recent_requests = dashboard_recent_requests[-10:]
+        dashboard_recent_requests = dashboard_recent_requests[:25]
         return {
             "request_logs": recent_request_logs[-10:],
             "recent_requests": dashboard_recent_requests,
