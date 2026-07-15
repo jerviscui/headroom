@@ -147,9 +147,7 @@ def test_batch_keeps_structured_shell_output_without_a_ccr_marker():
     )
 
     assert not any(result.modified for _, result in results)
-    assert [result.reason for _, result in results] == [
-        "lossy_unrecoverable_tool_output"
-    ] * 4
+    assert [result.reason for _, result in results] == ["lossy_unrecoverable_tool_output"] * 4
 
 
 class _MarkerStrippingRouter:
