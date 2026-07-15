@@ -468,3 +468,25 @@ def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
     assert client.get("/admin/upstream").status_code == 404
     assert client.get("/debug/tasks").status_code == 404
     assert client.post("/stats/reset").status_code == 404
+
+
+def test_dashboard_client_cidr_grants_transformations_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS",
+        "100.90.0.5/32",
+    )
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.get(
+        "/transformations/feed",
+        headers={"origin": "http://100.82.0.2:8787"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "transformations" in response.json()

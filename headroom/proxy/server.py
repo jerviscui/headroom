@@ -3831,20 +3831,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return history
 
-    @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
-    async def transformations_feed(limit: int = 20):
+    @app.get("/transformations/feed")
+    async def transformations_feed(request: Request, limit: int = 20):
         """Get recent message transformations for the live feed.
 
-        Loopback-only: when ``log_full_messages`` is enabled this returns the
+        Loopback callers and explicitly trusted dashboard clients may read the
         full request/response message bodies (prompt content and completions)
         via ``request_messages`` / ``compressed_messages`` / ``response_content``.
-        With the default ``--host 0.0.0.0`` Docker bind, leaving it open would
-        expose chat history to anyone able to reach the proxy port. The
-        dashboard runs in the user's browser on loopback, so this gate does not
-        break legitimate use.
+        Other network callers receive 404 so chat history is not exposed merely
+        because they can reach the proxy port.
 
         Returns empty list if log_full_messages is disabled (messages are not stored).
         """
+        if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
+            raise HTTPException(status_code=404)
+
         if limit > 100:
             limit = 100
 
