@@ -82,6 +82,25 @@ def redact_image_base64(payload: Any) -> Any:
     return result.value
 
 
+def _redact_response_content(response_content: str) -> str:
+    """Redact nested image data in serialized JSON response payloads."""
+
+    stripped = response_content.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(response_content)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            return json.dumps(
+                redact_image_base64(parsed),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+    redacted = redact_image_base64(response_content)
+    return redacted if isinstance(redacted, str) else response_content
+
+
 class RequestLogger:
     """Log requests to JSONL file.
 
@@ -127,7 +146,7 @@ class RequestLogger:
         if entry.compressed_messages is not None:
             entry.compressed_messages = redact_image_base64(entry.compressed_messages)
         if entry.response_content is not None:
-            entry.response_content = redact_image_base64(entry.response_content)
+            entry.response_content = _redact_response_content(entry.response_content)
 
         self._logs.append(entry)
 

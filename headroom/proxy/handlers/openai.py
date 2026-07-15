@@ -1066,6 +1066,26 @@ def _openai_response_create_frame_input_tokens(
     return _openai_responses_payload_input_tokens(payload, token_provider)
 
 
+def _openai_responses_messages_for_log(frame: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return a stable, diffable log view of a Responses request frame."""
+
+    payload = frame.get("response") if isinstance(frame.get("response"), dict) else frame
+    if not isinstance(payload, dict):
+        return []
+
+    messages: list[dict[str, Any]] = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    request_input = payload.get("input")
+    if isinstance(request_input, str) and request_input:
+        messages.append({"role": "user", "content": request_input})
+    elif isinstance(request_input, list):
+        messages.extend(copy.deepcopy(item) for item in request_input if isinstance(item, dict))
+    return messages
+
+
 def _shape_openai_response_create_frame(
     raw_msg: str,
     *,
@@ -5410,6 +5430,10 @@ class OpenAIHandlerMixin:
             attempted_input_tokens_total = 0
             transforms_applied: list[str] = []
             ws_frames_compressed = 0
+            ws_pending_log_payloads: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            ws_last_request_messages_for_log: list[dict[str, Any]] | None = None
+            ws_last_compressed_messages_for_log: list[dict[str, Any]] | None = None
+            ws_last_response_content_for_log: str | None = None
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -6002,6 +6026,14 @@ class OpenAIHandlerMixin:
                 _first_upstream_body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
                 _first_upstream_body = None
+            if (
+                getattr(self.config, "log_full_messages", False)
+                and isinstance(body, dict)
+                and isinstance(_first_upstream_body, dict)
+            ):
+                ws_pending_log_payloads.append(
+                    (copy.deepcopy(body), copy.deepcopy(_first_upstream_body))
+                )
             capture_codex_wire_debug(
                 "ws_upstream_first_frame",
                 request_id=request_id,
@@ -6378,6 +6410,18 @@ class OpenAIHandlerMixin:
                                     _outbound_frame_body = json.loads(msg)
                                 except json.JSONDecodeError:
                                     _outbound_frame_body = None
+                                if (
+                                    getattr(self.config, "log_full_messages", False)
+                                    and isinstance(_inbound_frame_body, dict)
+                                    and _inbound_frame_body.get("type") == "response.create"
+                                    and isinstance(_outbound_frame_body, dict)
+                                ):
+                                    ws_pending_log_payloads.append(
+                                        (
+                                            copy.deepcopy(_inbound_frame_body),
+                                            copy.deepcopy(_outbound_frame_body),
+                                        )
+                                    )
                                 capture_codex_wire_debug(
                                     "ws_upstream_client_frame",
                                     request_id=request_id,
@@ -6477,7 +6521,9 @@ class OpenAIHandlerMixin:
 
                         response_started_ms: float | None = None
 
-                        async def _record_ws_response_metrics() -> None:
+                        async def _record_ws_response_metrics(
+                            response: dict[str, Any] | None = None,
+                        ) -> None:
                             """Record one completed Responses turn on long-lived WS sessions."""
                             nonlocal ws_recorded_input_tokens_total
                             nonlocal ws_recorded_output_tokens_total
@@ -6487,6 +6533,30 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_tokens_saved_total
                             nonlocal ws_recorded_attempted_input_tokens_total
                             nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+                            nonlocal ws_last_request_messages_for_log
+                            nonlocal ws_last_compressed_messages_for_log
+                            nonlocal ws_last_response_content_for_log
+
+                            log_request_messages: list[dict[str, Any]] | None = None
+                            log_compressed_messages: list[dict[str, Any]] | None = None
+                            response_content_for_log: str | None = None
+                            if getattr(self.config, "log_full_messages", False):
+                                if ws_pending_log_payloads:
+                                    original_frame, compressed_frame = ws_pending_log_payloads.pop(
+                                        0
+                                    )
+                                    log_request_messages = _openai_responses_messages_for_log(
+                                        original_frame
+                                    )
+                                    log_compressed_messages = _openai_responses_messages_for_log(
+                                        compressed_frame
+                                    )
+                                if isinstance(response, dict):
+                                    response_content_for_log = json.dumps(
+                                        response,
+                                        separators=(",", ":"),
+                                        ensure_ascii=False,
+                                    )
 
                             input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
                             output_delta = ws_output_tokens_total - ws_recorded_output_tokens_total
@@ -6520,6 +6590,8 @@ class OpenAIHandlerMixin:
                                 and attempted_delta <= 0
                                 and overhead_delta_ms <= 0
                                 and ttfb_for_record_ms <= 0
+                                and log_request_messages is None
+                                and response_content_for_log is None
                             ):
                                 return
 
@@ -6544,6 +6616,7 @@ class OpenAIHandlerMixin:
                             # at the WS upgrade) so dashboards can
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
+                            turn_log_tags = {**ws_tags, "log_scope": "responses_ws_turn"}
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     request_id=request_id,
@@ -6562,15 +6635,23 @@ class OpenAIHandlerMixin:
                                     ttfb_ms=ttfb_for_record_ms,
                                     pipeline_timing=dashboard_pipeline_timing,
                                     transforms_applied=tuple(transforms_applied),
-                                    num_messages=len(
-                                        body.get("messages") or body.get("input") or []
-                                    )
-                                    if isinstance(body, dict)
-                                    else 0,
-                                    tags=ws_tags,
+                                    num_messages=(
+                                        len(log_request_messages)
+                                        if log_request_messages is not None
+                                        else len(body.get("messages") or body.get("input") or [])
+                                        if isinstance(body, dict)
+                                        else 0
+                                    ),
+                                    tags=turn_log_tags,
+                                    request_messages=log_request_messages,
+                                    compressed_messages=log_compressed_messages,
+                                    response_content=response_content_for_log,
                                     client=client,
                                 )
                             )
+                            ws_last_request_messages_for_log = log_request_messages
+                            ws_last_compressed_messages_for_log = log_compressed_messages
+                            ws_last_response_content_for_log = response_content_for_log
 
                             # Structured PERF log line so ``headroom perf``
                             # counts this Codex turn. Pre-P2 this emit was
@@ -6716,7 +6797,7 @@ class OpenAIHandlerMixin:
                                 if not memory_enabled:
                                     if event_type == "response.completed":
                                         response_completed_seen = True
-                                        await _record_ws_response_metrics()
+                                        await _record_ws_response_metrics(event.get("response"))
                                     await websocket.send_text(msg_str)
                                     continue
 
@@ -6751,7 +6832,7 @@ class OpenAIHandlerMixin:
                                 for buf in event_buffer:
                                     await websocket.send_text(buf)
                                 event_buffer.clear()
-                                await _record_ws_response_metrics()
+                                await _record_ws_response_metrics(event.get("response"))
                                 _reset()
                                 response_completed_seen = True
 
@@ -6769,7 +6850,7 @@ class OpenAIHandlerMixin:
 
                                     elif event_type == "response.completed":
                                         response_completed_seen = True
-                                        await _record_ws_response_metrics()
+                                        await _record_ws_response_metrics(event.get("response"))
                                         resp = event.get("response", {})
                                         resp_id = resp.get("id")
 
@@ -7069,6 +7150,7 @@ class OpenAIHandlerMixin:
                 "cache_read_tokens": str(ws_cache_read_tokens_total),
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
+                "log_scope": "responses_ws_session",
             }
             if (
                 residual_input_tokens > 0
@@ -7117,15 +7199,18 @@ class OpenAIHandlerMixin:
                 from headroom.proxy.helpers import compute_turn_id
                 from headroom.proxy.models import RequestLog
 
-                ws_messages_for_log: list[dict[str, Any]] = []
-                ws_input_for_log = ws_inner_for_telemetry.get("input")
-                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
-                if isinstance(ws_instructions_for_log, str) and ws_instructions_for_log:
-                    ws_messages_for_log.append(
-                        {"role": "system", "content": ws_instructions_for_log}
+                ws_messages_for_log = ws_last_request_messages_for_log
+                ws_compressed_messages_for_log = ws_last_compressed_messages_for_log
+                ws_response_content_for_log = ws_last_response_content_for_log
+                if ws_messages_for_log is None and ws_pending_log_payloads:
+                    pending_original, pending_compressed = ws_pending_log_payloads[-1]
+                    ws_messages_for_log = _openai_responses_messages_for_log(pending_original)
+                    ws_compressed_messages_for_log = _openai_responses_messages_for_log(
+                        pending_compressed
                     )
-                if isinstance(ws_input_for_log, str) and ws_input_for_log:
-                    ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
+                if ws_messages_for_log is None:
+                    ws_messages_for_log = _openai_responses_messages_for_log(ws_inner_for_telemetry)
+                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
                 self.logger.log(
                     RequestLog(
                         request_id=request_id,
@@ -7147,6 +7232,12 @@ class OpenAIHandlerMixin:
                         cache_hit=False,
                         transforms_applied=transforms_applied,
                         request_messages=ws_messages_for_log
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        compressed_messages=ws_compressed_messages_for_log
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        response_content=ws_response_content_for_log
                         if getattr(self.config, "log_full_messages", False)
                         else None,
                         turn_id=compute_turn_id(

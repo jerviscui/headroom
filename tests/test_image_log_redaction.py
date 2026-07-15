@@ -197,6 +197,29 @@ def test_response_content_data_image_url_redacted():
     )
 
 
+def test_response_content_json_redacts_nested_image_data_url():
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    payload = _big_base64(IMAGE_BASE64_REDACT_THRESHOLD_BYTES * 2)
+    data_url = f"data:image/png;base64,{payload}"
+    response_content = json.dumps(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "image_url", "image_url": {"url": data_url}}],
+                }
+            ]
+        }
+    )
+
+    logger.log(_make_request_log(response_content=response_content))
+
+    logged = json.loads(logger.get_recent_with_messages(n=1)[0]["response_content"])
+    assert logged["output"][0]["content"][0]["image_url"]["url"] == (
+        IMAGE_BASE64_REPLACEMENT_TEMPLATE.format(n=len(data_url))
+    )
+
+
 def test_non_image_path_base64_passes_through():
     """M2: a big base64-shaped string at a non-image-bearing key
     (e.g. an encrypted blob under ``signature`` or a tool output

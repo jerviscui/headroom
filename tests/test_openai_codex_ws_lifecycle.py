@@ -18,6 +18,7 @@ import pytest
 
 import headroom.proxy.handlers.openai as openai_module
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.request_logger import RequestLogger
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
 # ---------------------------------------------------------------------------
@@ -700,6 +701,84 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["cache_read_tokens"] == 75
     assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_ws_full_message_log_records_list_input_before_after_and_response():
+    original_output = "verbose tool output that should be compressed"
+    compressed_output = "short output"
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "instructions": "system instructions",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": original_output,
+                    }
+                ],
+            },
+        }
+    )
+    completed_response = {
+        "id": "r_1",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            }
+        ],
+        "usage": {"input_tokens": 20, "output_tokens": 1},
+    }
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": completed_response}),
+        ]
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.config.log_full_messages = True
+    handler.logger = RequestLogger(log_file=None, log_full_messages=True)
+
+    def _compress(payload, *, model, request_id, timing=None):
+        new_payload = json.loads(json.dumps(payload))
+        new_payload["input"][0]["output"] = compressed_output
+        return new_payload, True, 4, ["router:test"], "compressed", 100, 50, 10
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(_FakeWebSocket(frames=[first_frame]))
+
+    turn_logs = [
+        entry
+        for entry in handler.logger.get_recent_with_messages()
+        if entry["tags"].get("log_scope") == "responses_ws_turn"
+    ]
+    assert len(turn_logs) == 1
+    entry = turn_logs[0]
+    assert entry["request_messages"] == [
+        {"role": "system", "content": "system instructions"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": original_output,
+        },
+    ]
+    assert entry["compressed_messages"] == [
+        {"role": "system", "content": "system instructions"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": compressed_output,
+        },
+    ]
+    assert json.loads(entry["response_content"]) == completed_response
 
 
 @pytest.mark.asyncio

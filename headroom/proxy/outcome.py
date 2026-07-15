@@ -139,6 +139,9 @@ class RequestOutcome:
     # (``original_messages``); otherwise ``request_messages`` carries the sent
     # body for backward compatibility and this stays ``None``.
     compressed_messages: list[dict[str, Any]] | None = None
+    # Full upstream response payload serialized as JSON/text when explicitly
+    # enabled by the handler's full-message logging gate.
+    response_content: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
@@ -438,6 +441,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 waste_signals=outcome.waste_signals,
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
+                response_content=outcome.response_content,
                 turn_id=outcome.turn_id,
             )
         )
