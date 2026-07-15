@@ -76,6 +76,57 @@ def test_loopback_caller_allowed(method: str, path: str) -> None:
 
 
 # CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).
+def test_stats_lifetime_route_uses_dashboard_metadata_access_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS",
+        "100.90.0.5/32",
+    )
+    app = _make_app()
+    expected = {
+        "requests": {"total": 7},
+        "projects": {"headroom": {"requests": 3}},
+        "persistence": {
+            "enabled": True,
+            "healthy": False,
+            "error": "D:/private/proxy_savings.json: access denied",
+        },
+    }
+    monkeypatch.setattr(
+        app.state.proxy.metrics.savings_tracker,
+        "lifetime_response",
+        lambda: expected,
+    )
+
+    network = TestClient(app).get("/stats-lifetime")
+    assert network.status_code == 200, network.text
+    assert network.json() == {
+        "requests": {"total": 7},
+        "persistence": {
+            "enabled": True,
+            "healthy": False,
+            "error": None,
+        },
+    }
+
+    loopback = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ).get("/stats-lifetime")
+    assert loopback.status_code == 200, loopback.text
+    assert loopback.json() == expected
+
+    trusted_dashboard = TestClient(
+        app,
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    ).get("/stats-lifetime")
+    assert trusted_dashboard.status_code == 200, trusted_dashboard.text
+    assert trusted_dashboard.json() == expected
+
+
 CCR_GATED = [
     ("post", "/v1/retrieve"),
     ("get", "/v1/retrieve/stats"),
