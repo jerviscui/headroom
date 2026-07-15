@@ -3757,6 +3757,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             payload.pop("request_logs", None)
         return payload
 
+    @app.get("/stats-lifetime")
+    async def stats_lifetime(request: Request):
+        """Return persisted lifetime aggregates with sensitive fields gated."""
+        payload = dict(proxy.metrics.savings_tracker.lifetime_response())
+        include_sensitive = _request_can_view_dashboard_metadata(
+            request,
+            trusted_dashboard_client_cidrs,
+        )
+        if not include_sensitive:
+            payload.pop("projects", None)
+            persistence = payload.get("persistence")
+            if isinstance(persistence, dict):
+                payload["persistence"] = {**persistence, "error": None}
+        return payload
+
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
     async def stats_reset():
         """Reset in-memory proxy stats for local test/debug isolation."""
