@@ -148,6 +148,72 @@ async def test_finalize_stream_response_logs_original_and_compressed_messages():
 
 
 @pytest.mark.asyncio
+async def test_finalize_openai_responses_stream_logs_list_input_and_response():
+    proxy = _build_proxy_with_real_logger(log_full_messages=True)
+    original = [
+        {"role": "system", "content": "original instructions"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "verbose"},
+    ]
+    compressed = [
+        {"role": "system", "content": "original instructions"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "short"},
+    ]
+    response = {"id": "resp_1", "output": [{"type": "message"}]}
+
+    await proxy._finalize_stream_response(
+        body={"model": "gpt-5.6", "input": [{"type": "function_call_output"}]},
+        provider="openai",
+        model="gpt-5.6",
+        request_id="req-openai-responses-full-log",
+        original_tokens=10,
+        optimized_tokens=8,
+        tokens_saved=2,
+        transforms_applied=["router:test"],
+        optimization_latency=1.0,
+        stream_state=_stream_state(output_tokens=5),
+        start_time=0.0,
+        request_messages=original,
+        compressed_messages=compressed,
+        parsed_response=response,
+    )
+
+    entry = proxy.logger.get_recent_with_messages(1)[0]
+    assert entry["request_messages"] == original
+    assert entry["compressed_messages"] == compressed
+    assert json.loads(entry["response_content"]) == response
+
+
+@pytest.mark.asyncio
+async def test_finalize_openai_responses_stream_parses_completed_response_for_log():
+    proxy = _build_proxy_with_real_logger(log_full_messages=True)
+    response = {"id": "resp_from_sse", "output": [{"type": "message"}]}
+    full_sse_data = (
+        "event: response.completed\n"
+        f"data: {json.dumps({'type': 'response.completed', 'response': response})}\n\n"
+    )
+
+    await proxy._finalize_stream_response(
+        body={"model": "gpt-5.6", "input": []},
+        provider="openai",
+        model="gpt-5.6",
+        request_id="req-openai-responses-sse-log",
+        original_tokens=0,
+        optimized_tokens=0,
+        tokens_saved=0,
+        transforms_applied=[],
+        optimization_latency=0.0,
+        stream_state=_stream_state(output_tokens=1),
+        start_time=0.0,
+        request_messages=[],
+        compressed_messages=[],
+        full_sse_data=full_sse_data,
+    )
+
+    entry = proxy.logger.get_recent_with_messages(1)[0]
+    assert json.loads(entry["response_content"]) == response
+
+
+@pytest.mark.asyncio
 async def test_finalize_stream_response_omits_messages_when_log_full_messages_disabled():
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
 
@@ -172,6 +238,7 @@ async def test_finalize_stream_response_omits_messages_when_log_full_messages_di
     # is off.
     assert entries[0]["request_messages"] is None
     assert entries[0]["compressed_messages"] is None
+    assert entries[0]["response_content"] is None
 
 
 @pytest.mark.asyncio

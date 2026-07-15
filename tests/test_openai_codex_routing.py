@@ -15,6 +15,7 @@ from headroom.proxy.handlers.openai import (
     _openai_responses_unit_cache_key,
     _resolve_codex_routing_headers,
 )
+from headroom.proxy.request_logger import RequestLogger
 
 
 def _jwt(payload: dict) -> str:
@@ -185,6 +186,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         )
         self.captured_request: tuple[str, str, dict, dict] | None = None
         self.captured_stream_request: tuple[str, dict, dict] | None = None
+        self.captured_stream_kwargs: dict = {}
 
     async def _next_request_id(self) -> str:
         return "req-1"
@@ -228,6 +230,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         **kwargs,
     ):
         self.captured_stream_request = (url, headers, body)
+        self.captured_stream_kwargs = dict(kwargs)
         return SimpleNamespace(
             status_code=200,
             url=url,
@@ -372,6 +375,41 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert response.status_code == 200
 
 
+def test_handle_openai_responses_logs_list_input_before_after_and_response(monkeypatch):
+    request = _build_request(
+        {
+            "model": "gpt-5.6",
+            "instructions": "system instructions",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "tool output",
+                }
+            ],
+        },
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.log_full_messages = True
+    handler.logger = RequestLogger(log_file=None, log_full_messages=True)
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    anyio.run(handler.handle_openai_responses, request)
+
+    entry = handler.logger.get_recent_with_messages(1)[0]
+    expected_messages = [
+        {"role": "system", "content": "system instructions"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "tool output"},
+    ]
+    assert entry["request_messages"] == expected_messages
+    assert entry["compressed_messages"] == expected_messages
+    assert json.loads(entry["response_content"]) == {
+        "usage": {"input_tokens": 2, "output_tokens": 1}
+    }
+
+
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     """PR-C5: Python no longer compresses /v1/responses (Rust handles it
     natively). The streaming forward path must still fire — only the
@@ -393,6 +431,7 @@ def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.log_full_messages = True
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
@@ -402,6 +441,16 @@ def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     assert handler.captured_stream_request is not None
     assert handler.openai_pipeline.apply.call_count == 0
     assert handler.captured_stream_request[2]["stream"] is True
+    expected_messages = [
+        {"role": "system", "content": "Keep it short"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+    ]
+    assert handler.captured_stream_kwargs["request_messages"] == expected_messages
+    assert handler.captured_stream_kwargs["compressed_messages"] == expected_messages
 
 
 def test_handle_openai_responses_memory_timeout_fails_open(monkeypatch):

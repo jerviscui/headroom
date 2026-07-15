@@ -361,8 +361,23 @@ class StreamingMixin:
         ``signature_delta``, ``citations_delta``. Also preserves
         ``redacted_thinking.data`` and accumulates citations as a list.
         """
+        if provider == "openai":
+            for line in sse_data.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "response.completed"
+                    and isinstance(event.get("response"), dict)
+                ):
+                    return event["response"]
+            return None
         if provider != "anthropic":
-            return None  # Only implemented for Anthropic
+            return None  # Only implemented for Anthropic and OpenAI Responses
 
         response: dict[str, Any] = {"content": [], "usage": {}}
         # Track blocks by their `index` field so out-of-order events
@@ -803,6 +818,9 @@ class StreamingMixin:
         pipeline_timing: dict[str, float] | None = None,
         prefix_tracker: Any | None = None,
         original_messages: list[dict] | None = None,
+        request_messages: list[dict] | None = None,
+        compressed_messages: list[dict] | None = None,
+        response_content: str | None = None,
         full_sse_data: str = "",
         parsed_response: dict[str, Any] | None = None,
         client: str | None = None,
@@ -812,6 +830,20 @@ class StreamingMixin:
 
         outcome_provider = outcome_provider or provider
         total_latency = (time.time() - start_time) * 1000
+        if (
+            response_content is None
+            and getattr(self.config, "log_full_messages", False)
+            and provider == "openai"
+        ):
+            response_for_log = parsed_response or self._parse_sse_to_response(
+                full_sse_data, provider
+            )
+            if response_for_log is not None:
+                response_content = json.dumps(
+                    response_for_log,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
         # When upstream truncates mid-event (client disconnect, network
@@ -951,6 +983,9 @@ class StreamingMixin:
             ttfb_ms=stream_state["ttfb_ms"] or total_latency,
             pipeline_timing=pipeline_timing,
             original_messages=original_messages,
+            request_messages=request_messages,
+            compressed_messages=compressed_messages,
+            response_content=response_content,
             waste_signals=waste_signals,
         )
         await self._record_request_outcome(outcome)
@@ -981,6 +1016,8 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        request_messages: list[dict] | None = None,
+        compressed_messages: list[dict] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1026,6 +1063,8 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                request_messages=request_messages,
+                compressed_messages=compressed_messages,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1056,6 +1095,8 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        request_messages: list[dict] | None,
+        compressed_messages: list[dict] | None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1329,6 +1370,8 @@ class StreamingMixin:
                 pipeline_timing=pipeline_timing,
                 prefix_tracker=prefix_tracker,
                 original_messages=original_messages,
+                request_messages=request_messages,
+                compressed_messages=compressed_messages,
                 client=client,
                 waste_signals=waste_signals,
             )
@@ -1606,6 +1649,8 @@ class StreamingMixin:
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=prefix_tracker,
                     original_messages=original_messages,
+                    request_messages=request_messages,
+                    compressed_messages=compressed_messages,
                     full_sse_data=_final_full_sse_data,
                     parsed_response=parsed_response,
                     client=client,

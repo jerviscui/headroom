@@ -217,6 +217,9 @@ class RequestOutcome:
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
         original_messages: list[dict] | None = None,
+        request_messages: list[dict] | None = None,
+        compressed_messages: list[dict] | None = None,
+        response_content: str | None = None,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -261,6 +264,10 @@ class RequestOutcome:
         system = body.get("system")
         if system is None:
             system = body.get("systemInstruction")
+        if system is None:
+            system = body.get("instructions")
+        if request_messages is not None:
+            turn_messages = request_messages
 
         # ``request_items`` is ``body["messages"]`` (or ``body["contents"]``
         # for Gemini, falling back to ``[]``) — the post-compression list the
@@ -274,12 +281,19 @@ class RequestOutcome:
         if not log_full_messages:
             log_request_messages = None
             log_compressed_messages = None
+            log_response_content = None
+        elif request_messages is not None:
+            log_request_messages = request_messages
+            log_compressed_messages = compressed_messages
+            log_response_content = response_content
         elif original_messages is not None:
             log_request_messages = original_messages
             log_compressed_messages = request_items
+            log_response_content = response_content
         else:
             log_request_messages = request_items
             log_compressed_messages = None
+            log_response_content = response_content
 
         return cls(
             request_id=request_id,
@@ -308,6 +322,7 @@ class RequestOutcome:
             client=client,
             request_messages=log_request_messages,
             compressed_messages=log_compressed_messages,
+            response_content=log_response_content,
         )
 
 

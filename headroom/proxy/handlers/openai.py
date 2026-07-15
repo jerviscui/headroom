@@ -4004,6 +4004,11 @@ class OpenAIHandlerMixin:
             messages.append({"role": "system", "content": instructions})
         if isinstance(input_data, str):
             messages.append({"role": "user", "content": input_data})
+        original_log_messages = (
+            _openai_responses_messages_for_log(body)
+            if getattr(self.config, "log_full_messages", False)
+            else None
+        )
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -4531,6 +4536,16 @@ class OpenAIHandlerMixin:
         try:
             if stream and not buffered_stream_ccr:
                 # Streaming for Responses API uses semantic events
+                stream_log_tags = {
+                    **tags,
+                    "endpoint": "responses_http",
+                    "log_scope": "responses_http_stream",
+                }
+                compressed_log_messages = (
+                    _openai_responses_messages_for_log(body)
+                    if getattr(self.config, "log_full_messages", False)
+                    else None
+                )
                 return await self._stream_response(
                     url,
                     headers,
@@ -4542,7 +4557,7 @@ class OpenAIHandlerMixin:
                     optimized_tokens,
                     tokens_saved,
                     transforms_applied,
-                    tags,
+                    stream_log_tags,
                     optimization_latency,
                     memory_user_id=memory_user_id,
                     memory_request_ctx=memory_request_ctx,
@@ -4550,6 +4565,8 @@ class OpenAIHandlerMixin:
                     body_mutated=body_mutation_tracker.mutated,
                     mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
+                    request_messages=original_log_messages,
+                    compressed_messages=compressed_log_messages,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
@@ -4824,7 +4841,19 @@ class OpenAIHandlerMixin:
                     **(tags or {}),
                     "auth_mode": auth_mode.value if auth_mode else "payg",
                     "endpoint": "responses_http",
+                    "log_scope": "responses_http",
                 }
+                compressed_log_messages = (
+                    _openai_responses_messages_for_log(body)
+                    if getattr(self.config, "log_full_messages", False)
+                    else None
+                )
+                response_content_for_log = (
+                    json.dumps(resp_json, ensure_ascii=False, separators=(",", ":"))
+                    if getattr(self.config, "log_full_messages", False)
+                    and isinstance(resp_json, dict)
+                    else None
+                )
 
                 # OpenAI Responses HTTP (non-WS, non-streaming). Codex
                 # uses this path when configured for HTTP transport.
@@ -4854,9 +4883,9 @@ class OpenAIHandlerMixin:
                         num_messages=len(messages) if isinstance(messages, list) else 0,
                         tags=_resp_log_tags,
                         turn_id=compute_turn_id(model, body.get("instructions"), messages),
-                        request_messages=messages
-                        if getattr(self.config, "log_full_messages", False)
-                        else None,
+                        request_messages=original_log_messages,
+                        compressed_messages=compressed_log_messages,
+                        response_content=response_content_for_log,
                         client=client,
                     )
                 )
