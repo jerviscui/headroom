@@ -945,7 +945,7 @@ class SavingsTracker:
         """Return the durable aggregate used only by ``/stats-lifetime``."""
 
         with self._lock:
-            return self._persistent_metrics.snapshot(
+            response = self._persistent_metrics.snapshot(
                 persistence={
                     "enabled": not self._stateless,
                     "healthy": self._persistence_healthy,
@@ -957,6 +957,8 @@ class SavingsTracker:
                     "pending_records": 0 if self._stateless else self._since_save,
                 }
             )
+            response["projects"] = self._projects_snapshot_locked()
+            return response
 
     def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
         """Return a compact preview for `/stats`."""
