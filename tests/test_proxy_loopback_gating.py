@@ -224,6 +224,104 @@ def test_dashboard_client_cidr_grants_stats_metadata_for_ip_literal_host(
     assert "config" in payload
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"origin": "http://100.82.0.2:8787"},
+        {"referer": "http://100.82.0.2:8787/dashboard"},
+    ],
+)
+@pytest.mark.parametrize("cached", [False, True])
+def test_dashboard_client_cidr_grants_stats_metadata_to_same_origin_browser(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str], cached: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    payload = client.get(
+        "/stats", params={"cached": int(cached)}, headers=headers
+    ).json()
+
+    assert "recent_requests" in payload
+    assert "request_logs" in payload
+    assert "config" in payload
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"origin": "http://attacker.example"},
+        {"referer": "http://attacker.example/dashboard"},
+    ],
+)
+@pytest.mark.parametrize("cached", [False, True])
+def test_dashboard_client_cidr_hides_stats_metadata_from_cross_origin_browser(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str], cached: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.get(
+        "/stats", params={"cached": int(cached)}, headers=headers
+    )
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert "tokens" in payload
+    assert "recent_requests" not in payload
+    assert "request_logs" not in payload
+    assert "config" not in payload
+
+
+def test_dashboard_client_cidr_only_uses_forwarded_proto_from_trusted_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "172.18.0.0/16")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("172.18.0.1", 12345),
+    )
+
+    payload = client.get(
+        "/stats",
+        headers={
+            "origin": "https://100.82.0.2:8787",
+            "x-forwarded-for": "100.90.0.5",
+            "x-forwarded-proto": "https",
+        },
+    ).json()
+
+    assert "recent_requests" in payload
+    assert "request_logs" in payload
+    assert "config" in payload
+
+    spoofed = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    ).get(
+        "/stats",
+        headers={
+            "origin": "https://100.82.0.2:8787",
+            "x-forwarded-proto": "https",
+        },
+    ).json()
+
+    assert "recent_requests" not in spoofed
+    assert "request_logs" not in spoofed
+    assert "config" not in spoofed
+
+
 def test_dashboard_client_cidr_rejects_unlisted_clients_and_hostname_hosts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
