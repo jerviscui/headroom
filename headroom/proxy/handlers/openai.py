@@ -1778,9 +1778,7 @@ class OpenAIHandlerMixin:
 
         router_total_started = time.perf_counter()
         routed_results: list[tuple[object, Any, float] | None] = [None] * len(routed_units)
-        unit_index_by_slot = {
-            routed.slot: unit_idx for unit_idx, routed in enumerate(routed_units)
-        }
+        unit_index_by_slot = {routed.slot: unit_idx for unit_idx, routed in enumerate(routed_units)}
         small_batch_entries: list[CompressionBatchEntry] = []
         large_unit_indexes: list[int] = []
         for unit_idx, routed in enumerate(routed_units):

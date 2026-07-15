@@ -16,6 +16,7 @@ from .compression_units import (
     UnitCompressionResult,
     _is_structured_shell_output,
 )
+from .content_router import RouterCompressionResult
 from .tag_protector import protect_tags, restore_tags
 
 DEFAULT_MAX_BATCH_BYTES = 2048
@@ -193,11 +194,11 @@ def _passthrough_batch_results(
     *,
     tokenizer: TokenCounterLike,
     reason: str,
-    router_result: object | None = None,
+    router_result: RouterCompressionResult | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
     strategy = (
         router_result.strategy_used.value
-        if isinstance(router_result, object) and hasattr(router_result, "strategy_used")
+        if router_result
         else CompressionStrategy.PASSTHROUGH.value
     )
     return [
@@ -213,7 +214,7 @@ def _passthrough_batch_results(
                 transforms_applied=[],
                 strategy=strategy,
                 reason=reason,
-                router_result=router_result if hasattr(router_result, "strategy_used") else None,
+                router_result=router_result,
                 text_bytes=_text_bytes(entry.routed.unit.text),
                 min_bytes=entry.routed.unit.min_bytes,
                 reason_category=reason,
