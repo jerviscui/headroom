@@ -1414,6 +1414,11 @@ class OpenAIHandlerMixin:
         if not isinstance(items, list):
             return payload, False, 0, [], {}, [], 0
         try:
+            from headroom.transforms.compression_batches import (
+                CompressionBatchEntry,
+                build_compression_batches,
+                compress_batch_with_router,
+            )
             from headroom.transforms.compression_units import (
                 CompressionUnit,
                 RoutedCompressionUnit,
@@ -1447,27 +1452,45 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
-        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+        def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
             # Only tool-output items are eligible for in-place compression.
             # Message items (user/system/assistant) sit inside the request's
             # cacheable prefix; mutating them busts prefix caching on every
             # subsequent turn. Role-level guards in compression_units.py
             # remain as defense-in-depth.
             type_tag = item.get("type")
-            if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
-                output_text = _responses_part_text(item.get("output"))
-                if output_text:
-                    return output_text, ("output", None)
-            return None
+            if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                return []
+            output = item.get("output")
+            if isinstance(output, str):
+                return [(output, ("output", None))]
+            if not isinstance(output, list):
+                return []
+            return [
+                (part["text"], ("output_part", index))
+                for index, part in enumerate(output)
+                if isinstance(part, dict)
+                and part.get("type") in {"input_text", "output_text"}
+                and isinstance(part.get("text"), str)
+            ]
 
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
-        ) -> None:
-            kind, _ = slot
+        ) -> bool:
+            kind, index = slot
             if kind == "output":
                 item["output"] = replacement
+                return True
+            if kind == "output_part" and isinstance(index, int):
+                output = item.get("output")
+                if isinstance(output, list) and 0 <= index < len(output):
+                    part = output[index]
+                    if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}:
+                        part["text"] = replacement
+                        return True
+            return False
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
@@ -1599,25 +1622,25 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
-                slot = _slot_text(item)
-                if slot is not None:
-                    text, slot_ref = slot
-                    candidates.append((idx, slot_ref, text))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": True,
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
-                                "item": item,
-                                "text": text,
-                            }
-                        )
+                slots = _slot_texts(item)
+                if slots:
+                    for text, slot_ref in slots:
+                        candidates.append((idx, slot_ref, text))
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": True,
+                                    "item_type": item_type,
+                                    "role": item.get("role"),
+                                    "slot": slot_ref,
+                                    "text_chars": len(text),
+                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                    "text_json_shape": _json_shape(text),
+                                    "item": item,
+                                    "text": text,
+                                }
+                            )
                 else:
                     if debug_enabled:
                         extraction_debug.append(
@@ -1689,24 +1712,6 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
-        # Aggregate-then-floor: the Responses payload splits each tool output
-        # into its own unit, so a per-item size floor would reject every unit
-        # in a session made of many small tool outputs (e.g. Codex), yielding
-        # 0% savings even when the combined compressible text is large. The
-        # Anthropic path compresses the whole message list as one batch and is
-        # not subject to a per-item floor. Match that: evaluate the floor once
-        # against the *aggregate* compressible bytes of the extracted group. If
-        # the group as a whole clears the threshold, disable the per-unit floor
-        # so small units still reach the router; if the whole group is below
-        # the threshold, keep the floor so trivially small payloads are skipped.
-        aggregate_compressible_bytes = sum(
-            len(text.encode("utf-8", errors="replace")) for _, _, text in candidates
-        )
-        effective_unit_min_bytes = (
-            0
-            if aggregate_compressible_bytes >= self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
-            else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
-        )
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -1719,7 +1724,7 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=effective_unit_min_bytes,
+                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -1773,9 +1778,27 @@ class OpenAIHandlerMixin:
 
         router_total_started = time.perf_counter()
         routed_results: list[tuple[object, Any, float] | None] = [None] * len(routed_units)
+        unit_index_by_slot = {
+            routed.slot: unit_idx for unit_idx, routed in enumerate(routed_units)
+        }
+        small_batch_entries: list[CompressionBatchEntry] = []
+        large_unit_indexes: list[int] = []
+        for unit_idx, routed in enumerate(routed_units):
+            text_bytes = len(routed.unit.text.encode("utf-8", errors="replace"))
+            if text_bytes < routed.unit.min_bytes:
+                small_batch_entries.append(
+                    CompressionBatchEntry(entry_id=f"u{unit_idx}", routed=routed)
+                )
+            else:
+                large_unit_indexes.append(unit_idx)
+        small_batches, small_batch_skipped = build_compression_batches(
+            small_batch_entries,
+            min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+        )
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
-        for unit_idx, routed in enumerate(routed_units):
+        for unit_idx in large_unit_indexes:
+            routed = routed_units[unit_idx]
             cache_key = _openai_responses_unit_cache_key(
                 routed.unit,
                 model=model,
@@ -1830,6 +1853,39 @@ class OpenAIHandlerMixin:
                     cache_key,
                     _compress_and_store(unit_idx, cache_key, routed)[2],
                 )
+
+        # Tail batches below the shared 512B floor keep the existing size-floor
+        # result without entering the router or the unit-result cache.
+        for entry in small_batch_skipped:
+            unit_idx = unit_index_by_slot[entry.routed.slot]
+            routed_results[unit_idx] = _compress_routed_unit(entry.routed)
+
+        def _compress_batch(batch: Any) -> tuple[list[tuple[object, Any]], float]:
+            batch_started = time.perf_counter()
+            results = compress_batch_with_router(
+                batch,
+                router=router,
+                tokenizer=tokenizer,
+                target_ratio=unit_target_ratio,
+            )
+            return results, (time.perf_counter() - batch_started) * 1000.0
+
+        def _record_batch_result(batch_result: tuple[list[tuple[object, Any]], float]) -> None:
+            batch_results, elapsed_ms = batch_result
+            elapsed_per_unit = elapsed_ms / len(batch_results) if batch_results else 0.0
+            for slot, result in batch_results:
+                routed_results[unit_index_by_slot[slot]] = (slot, result, elapsed_per_unit)
+
+        if len(small_batches) > 1 and parallelism > 1:
+            executor = _openai_responses_unit_executor()
+            for start in range(0, len(small_batches), parallelism):
+                batch_group = small_batches[start : start + parallelism]
+                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
+                for future in as_completed(futures):
+                    _record_batch_result(future.result())
+        else:
+            for batch in small_batches:
+                _record_batch_result(_compress_batch(batch))
 
         ordered_routed_results = [result for result in routed_results if result is not None]
 
@@ -1937,12 +1993,12 @@ class OpenAIHandlerMixin:
             target_item = updated_items[item_idx]
             if not isinstance(target_item, dict):
                 continue
-            _set_slot_text(target_item, slot_ref, result.compressed)
-            modified = True
-            tokens_saved_total += result.tokens_saved
-            for transform in result.transforms_applied:
-                if transform not in transforms:
-                    transforms.append(transform)
+            if _set_slot_text(target_item, slot_ref, result.compressed):
+                modified = True
+                tokens_saved_total += result.tokens_saved
+                for transform in result.transforms_applied:
+                    if transform not in transforms:
+                        transforms.append(transform)
         _add_timing("compression_unit_apply_results", apply_started)
 
         # Splice byte/data-lossless folds of excluded tool outputs (grep/log/
@@ -1952,8 +2008,8 @@ class OpenAIHandlerMixin:
             e_target = updated_items[e_idx] if e_idx < len(updated_items) else None
             if not isinstance(e_target, dict):
                 continue
-            _set_slot_text(e_target, e_slot, e_folded)
-            modified = True
+            if _set_slot_text(e_target, e_slot, e_folded):
+                modified = True
             e_before = tokenizer.count_text(e_orig)
             e_saved = e_before - tokenizer.count_text(e_folded)
             if e_saved > 0:
