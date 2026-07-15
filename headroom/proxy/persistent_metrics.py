@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
-import math
-from typing import Any, Callable
-
+from typing import Any
 
 SCHEMA_VERSION = 5
 MAX_PROVIDER_VALUES = 32
@@ -112,6 +112,10 @@ def _empty_state() -> dict[str, Any]:
     }
 
 
+def _dict_or_empty(value: Any) -> dict[Any, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 class PersistentMetricsState:
     """In-memory Lifetime aggregate with deterministic, bounded dimensions."""
 
@@ -133,7 +137,7 @@ class PersistentMetricsState:
             if isinstance(value, str):
                 result[timestamp_key] = value
 
-        raw_requests = source.get("requests") if isinstance(source.get("requests"), dict) else {}
+        raw_requests = _dict_or_empty(source.get("requests"))
         for key in ("total", "cached", "failed", "rate_limited"):
             result["requests"][key] = _coerce_int(raw_requests.get(key))
         result["requests"]["by_provider"] = self._normalize_count_map(
@@ -143,11 +147,11 @@ class PersistentMetricsState:
             raw_requests.get("by_stack"), MAX_STACK_VALUES
         )
 
-        raw_tokens = source.get("tokens") if isinstance(source.get("tokens"), dict) else {}
+        raw_tokens = _dict_or_empty(source.get("tokens"))
         for key in ("input", "output", "attempted_input", "saved"):
             result["tokens"][key] = _coerce_int(raw_tokens.get(key))
 
-        raw_cache = source.get("prefix_cache") if isinstance(source.get("prefix_cache"), dict) else {}
+        raw_cache = _dict_or_empty(source.get("prefix_cache"))
         for key in (
             "requests",
             "hit_requests",
@@ -167,15 +171,15 @@ class PersistentMetricsState:
             raw_cache.get("misses_by_reason"), KNOWN_MISS_REASONS
         )
 
-        raw_cost = source.get("cost") if isinstance(source.get("cost"), dict) else {}
+        raw_cost = _dict_or_empty(source.get("cost"))
         for key in ("input_usd", "compression_savings_usd", "cache_savings_usd"):
             result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
         result["waste_signals"] = self._normalize_enum_map(
             source.get("waste_signals"), KNOWN_WASTE_SIGNALS
         )
 
-        raw_models = source.get("models") if isinstance(source.get("models"), dict) else {}
-        raw_tracked = raw_models.get("tracked") if isinstance(raw_models.get("tracked"), dict) else {}
+        raw_models = _dict_or_empty(source.get("models"))
+        raw_tracked = _dict_or_empty(raw_models.get("tracked"))
         for name, entry in raw_tracked.items():
             normalized_name = self._model_name(name)
             if normalized_name == "other":
@@ -183,7 +187,7 @@ class PersistentMetricsState:
                 continue
             result["models"]["tracked"][normalized_name] = _model_entry(entry)
         self._merge_model_entry(result["models"]["other"], _model_entry(raw_models.get("other")))
-        raw_persistence = source.get("persistence") if isinstance(source.get("persistence"), dict) else {}
+        raw_persistence = _dict_or_empty(source.get("persistence"))
         if isinstance(raw_persistence.get("last_saved_at"), str):
             result["persistence"]["last_saved_at"] = raw_persistence["last_saved_at"]
         return result
@@ -240,7 +244,13 @@ class PersistentMetricsState:
 
     @staticmethod
     def _merge_model_entry(destination: dict[str, Any], source: dict[str, Any]) -> None:
-        for key in ("requests", "input_tokens", "output_tokens", "attempted_input_tokens", "tokens_saved"):
+        for key in (
+            "requests",
+            "input_tokens",
+            "output_tokens",
+            "attempted_input_tokens",
+            "tokens_saved",
+        ):
             destination[key] += _coerce_int(source.get(key))
         if destination["last_activity_at"] is None or (
             source["last_activity_at"] is not None
@@ -277,7 +287,11 @@ class PersistentMetricsState:
     ) -> None:
         name = self._model_name(model)
         models = self._state["models"]
-        entry = models["other"] if name == "other" else models["tracked"].setdefault(name, _model_entry())
+        entry = (
+            models["other"]
+            if name == "other"
+            else models["tracked"].setdefault(name, _model_entry())
+        )
         entry["requests"] += 1
         entry["input_tokens"] += input_tokens
         entry["output_tokens"] += output_tokens
@@ -346,12 +360,16 @@ class PersistentMetricsState:
         cost["compression_savings_usd"] = round(
             cost["compression_savings_usd"] + _coerce_float(compression_savings_usd), 6
         )
-        cost["cache_savings_usd"] = round(cost["cache_savings_usd"] + _coerce_float(cache_savings_usd), 6)
+        cost["cache_savings_usd"] = round(
+            cost["cache_savings_usd"] + _coerce_float(cache_savings_usd), 6
+        )
 
         if isinstance(waste_signals, dict):
             for name, token_count in waste_signals.items():
                 bucket = name if isinstance(name, str) and name in KNOWN_WASTE_SIGNALS else "other"
-                self._state["waste_signals"][bucket] = self._state["waste_signals"].get(bucket, 0) + _coerce_int(token_count)
+                self._state["waste_signals"][bucket] = self._state["waste_signals"].get(
+                    bucket, 0
+                ) + _coerce_int(token_count)
 
         self._record_model(
             model=model,
@@ -445,5 +463,8 @@ class PersistentMetricsState:
             "cost": deepcopy(self._state["cost"]),
             "waste_signals": deepcopy(self._state["waste_signals"]),
             "by_model": self._by_model_snapshot(),
-            "persistence": {**deepcopy(persistence), "last_saved_at": self._state["persistence"]["last_saved_at"]},
+            "persistence": {
+                **deepcopy(persistence),
+                "last_saved_at": self._state["persistence"]["last_saved_at"],
+            },
         }
