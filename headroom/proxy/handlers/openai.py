@@ -1465,7 +1465,18 @@ class OpenAIHandlerMixin:
             if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 return None
             output = item.get("output")
-            output_text = _responses_part_text(output)
+            if isinstance(output, str):
+                output_text = output
+            elif isinstance(output, list):
+                output_text = "\n".join(
+                    part["text"]
+                    for part in output
+                    if isinstance(part, dict)
+                    and part.get("type") in {"input_text", "output_text"}
+                    and isinstance(part.get("text"), str)
+                )
+            else:
+                output_text = ""
             if output_text:
                 return output_text, ("output", None)
             return None

@@ -466,6 +466,57 @@ def test_openai_responses_adapter_compresses_small_array_parts_as_one_logical_ou
     ]
 
 
+def test_openai_responses_adapter_excludes_opaque_part_text_from_logical_output():
+    router = ContentRouter()
+    calls: list[str] = []
+    long_text = " ".join(f"word{index}" for index in range(180))
+    image_part = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,AA==",
+        "text": "opaque image metadata",
+    }
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": long_text},
+                    image_part,
+                ],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_opaque_part_text",
+        )
+    )
+
+    assert calls == [long_text]
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["output"] == [
+        {"type": "input_text", "text": "summary"},
+        image_part,
+    ]
+
+
 def test_openai_responses_adapter_skips_under_floor_small_batch():
     router = ContentRouter()
     calls = {"count": 0}
