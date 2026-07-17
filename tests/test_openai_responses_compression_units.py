@@ -891,7 +891,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
-                "output": [{"type": "output_text", "text": grep_out}],
+                "output": [{"type": "input_text", "text": grep_out}],
             },
         ],
     }
@@ -911,7 +911,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     # Output must remain a list (content-part array) — not replaced with a string
     assert isinstance(folded, list), f"expected list, got {type(folded).__name__}"
     assert len(folded) == 1
-    assert isinstance(folded[0], dict) and folded[0].get("type") == "output_text"
+    assert isinstance(folded[0], dict) and folded[0].get("type") == "input_text"
     assert len(folded[0]["text"]) < len(grep_out)
     assert search_unheading(folded[0]["text"]) == grep_out
 

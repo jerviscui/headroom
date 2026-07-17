@@ -1486,7 +1486,7 @@ class OpenAIHandlerMixin:
             slot: tuple[str, int | None],
             replacement: str,
         ) -> bool:
-            kind, _ = slot
+            kind, index = slot
             if kind == "output":
                 output = item.get("output")
                 if not isinstance(output, list):
@@ -1510,6 +1510,17 @@ class OpenAIHandlerMixin:
                 if inserted:
                     item["output"] = rewritten
                 return inserted
+            if kind == "output_part" and isinstance(index, int):
+                output = item.get("output")
+                if isinstance(output, list) and 0 <= index < len(output):
+                    part = output[index]
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") in {"input_text", "output_text"}
+                        and isinstance(part.get("text"), str)
+                    ):
+                        part["text"] = replacement
+                        return True
             return False
 
         headroom_retrieve_call_ids: set[str] = set()
