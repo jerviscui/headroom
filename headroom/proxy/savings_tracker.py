@@ -238,7 +238,12 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         output_cost_per_token = info.get("output_cost_per_token")
-        if not output_cost_per_token:
+        # Distinguish "price unknown" (missing key -> fall back to the estimate)
+        # from a model that is legitimately free (output_cost_per_token == 0.0).
+        # `if not ...` treated a real 0.0 as unavailable and billed the fallback
+        # rate -> phantom output savings for a model that costs nothing. Mirrors
+        # the fix already applied to `_estimate_compression_savings_usd`.
+        if output_cost_per_token is None:
             raise RuntimeError("output cost unavailable")
         return float(tokens_saved) * float(output_cost_per_token)
     except Exception:

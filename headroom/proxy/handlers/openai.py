@@ -1609,10 +1609,28 @@ class OpenAIHandlerMixin:
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
-                    excl_out = _responses_part_text(item.get("output"))
-                    fold = router._lossless_compact_excluded(excl_out) if excl_out else None
-                    if fold is not None:
-                        lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
+                    # Note: when output is a content-part array, fold each text part
+                    # individually using ("output_part", index) slots to preserve the
+                    # array structure (non-text parts like images are left untouched).
+                    raw_output = item.get("output")
+                    if isinstance(raw_output, list):
+                        for pidx, part in enumerate(raw_output):
+                            if (
+                                isinstance(part, dict)
+                                and part.get("type") in {"input_text", "output_text"}
+                                and isinstance(part.get("text"), str)
+                            ):
+                                part_text = part["text"]
+                                pf = router._lossless_compact_excluded(part_text)
+                                if pf is not None:
+                                    lossless_excluded.append(
+                                        (idx, ("output_part", pidx), pf[0], part_text)
+                                    )
+                    else:
+                        excl_out = _responses_part_text(raw_output)
+                        fold = router._lossless_compact_excluded(excl_out) if excl_out else None
+                        if fold is not None:
+                            lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
                             {

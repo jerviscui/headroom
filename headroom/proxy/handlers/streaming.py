@@ -443,6 +443,15 @@ class StreamingMixin:
                     # signature validation to pass.
                     if "data" in block:
                         current_block["data"] = block["data"]
+                elif btype:
+                    # Non-standard block (server_tool_use, web_search_tool_result,
+                    # ...): copy through all of the block's fields so the
+                    # reconstruction doesn't silently drop them to a bare
+                    # {type, index}. Mirrors the sibling reconstructor
+                    # `_reconstruct_anthropic_response`, which does `dict(block)`.
+                    for _k, _v in block.items():
+                        if _k != "type":
+                            current_block[_k] = _v
                 blocks_by_index[block_index] = current_block
 
             elif event_type == "content_block_delta":

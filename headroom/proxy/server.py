@@ -486,6 +486,15 @@ class LoopHealthState(TypedDict):
     last_known_failure: LoopFailureDetails | None
 
 
+class CompressionQuarantinedError(asyncio.TimeoutError):
+    """Compression was skipped while a timed-out worker was still running.
+
+    Inherit from ``asyncio.TimeoutError`` rather than the builtin directly so
+    Python 3.10 callers classify quarantine bypasses exactly like executor
+    timeouts. The two exception classes only became aliases in Python 3.11.
+    """
+
+
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
@@ -1011,6 +1020,16 @@ class HeadroomProxy(
         # Counter: threads that finished AFTER their asyncio future hit the
         # timeout. Stuck-thread leak indicator.
         self._compression_leaked_threads: int = 0
+        # Timeout-debt quarantine. Python cannot preempt a worker after its
+        # asyncio waiter times out, so accepting more compression while that
+        # worker is still running can multiply one slow call into a saturated
+        # executor. New work raises immediately until every known post-timeout
+        # worker has genuinely exited, then follows the caller's existing
+        # compression-failure policy.
+        self._compression_timed_out_in_flight: int = 0
+        self._compression_timed_out_in_flight_max: int = 0
+        self._compression_quarantine_activations: int = 0
+        self._compression_quarantine_skips: int = 0
         self._compression_metrics_lock = threading.Lock()
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
@@ -1240,10 +1259,14 @@ class HeadroomProxy(
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
-        block after it eventually finishes. Jobs that time out before a
-        worker starts are removed from the queued gauge instead. Operators
-        can see leaked-thread rate and queue pressure climbing in
-        ``/stats`` before the pool fills up.
+        block after it eventually finishes. While any such worker remains,
+        new calls raise :class:`CompressionQuarantinedError` immediately so
+        callers apply the existing compression-failure policy instead of
+        filling the rest of the pool with the same timeout debt. Jobs that are
+        successfully cancelled before a worker starts are removed from the
+        queued gauge and do not activate the quarantine. If cancellation races
+        with worker startup, the now-running job is tracked as timeout debt and
+        does activate it.
 
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
@@ -1260,20 +1283,71 @@ class HeadroomProxy(
         Raises:
             ``asyncio.TimeoutError`` if the callable doesn't return within
             ``timeout``. Any exception raised by ``fn`` propagates
-            unchanged.
+            unchanged. :class:`CompressionQuarantinedError` (an
+            ``asyncio.TimeoutError`` subclass) if a prior timed-out worker is
+            still running.
         """
+        with self._compression_metrics_lock:
+            timed_out_in_flight = self._compression_timed_out_in_flight
+            if timed_out_in_flight > 0:
+                self._compression_quarantine_skips += 1
+
+        if timed_out_in_flight > 0:
+            self.metrics.record_compression_quarantine("skipped")
+            raise CompressionQuarantinedError(
+                f"compression quarantined: {timed_out_in_flight} timed-out worker(s) still running"
+            )
+
         loop = asyncio.get_running_loop()
         queued_at = time.monotonic()
-        state = {"queued": True, "timed_out": False}
+        state = {
+            "queued": True,
+            "started": False,
+            "finished": False,
+            "timed_out": False,
+            "timeout_debt_recorded": False,
+        }
         with self._compression_metrics_lock:
             self._compression_queued += 1
             if self._compression_queued > self._compression_queued_max:
                 self._compression_queued_max = self._compression_queued
 
+        def _record_timeout_debt_locked() -> bool:
+            """Record a still-running post-timeout worker; lock must be held.
+
+            Returns ``True`` only when this worker transitions the executor
+            from clear to quarantined.
+            """
+            if (
+                not state["timed_out"]
+                or not state["started"]
+                or state["finished"]
+                or state["timeout_debt_recorded"]
+            ):
+                return False
+            was_clear = self._compression_timed_out_in_flight == 0
+            self._compression_timed_out_in_flight += 1
+            self._compression_timed_out_in_flight_max = max(
+                self._compression_timed_out_in_flight_max,
+                self._compression_timed_out_in_flight,
+            )
+            state["timeout_debt_recorded"] = True
+            if was_clear:
+                self._compression_quarantine_activations += 1
+            return was_clear
+
+        def _announce_quarantine() -> None:
+            self.metrics.record_compression_quarantine("activated")
+            logger.warning(
+                "Compression worker exceeded its request deadline and is still running; "
+                "new compression is quarantined until timed-out workers exit"
+            )
+
         def _wrapped():  # noqa: ANN202
             started_at = time.monotonic()
             queue_wait = started_at - queued_at
             with self._compression_metrics_lock:
+                state["started"] = True
                 if state["queued"]:
                     self._compression_queued -= 1
                     state["queued"] = False
@@ -1283,17 +1357,29 @@ class HeadroomProxy(
                 self._compression_in_flight += 1
                 if self._compression_in_flight > self._compression_in_flight_max:
                     self._compression_in_flight_max = self._compression_in_flight
+                quarantine_activated = _record_timeout_debt_locked()
+            if quarantine_activated:
+                _announce_quarantine()
             try:
                 return fn()
             finally:
                 elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
+                    state["finished"] = True
                     self._compression_in_flight -= 1
                     self._compression_run_seconds_total += elapsed
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
                         self._compression_leaked_threads += 1
+                    if state["timeout_debt_recorded"]:
+                        self._compression_timed_out_in_flight -= 1
+                        state["timeout_debt_recorded"] = False
+                        quarantine_cleared = self._compression_timed_out_in_flight == 0
+                    else:
+                        quarantine_cleared = False
+                if quarantine_cleared:
+                    logger.info("Compression quarantine cleared after all timed-out workers exited")
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
@@ -1305,6 +1391,9 @@ class HeadroomProxy(
                     self._compression_queued -= 1
                     state["queued"] = False
                     self._compression_queue_timeouts += 1
+                quarantine_activated = _record_timeout_debt_locked()
+            if quarantine_activated:
+                _announce_quarantine()
             raise
 
     async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
@@ -2461,6 +2550,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
+            _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
+            _comp_timed_out_in_flight_max = proxy._compression_timed_out_in_flight_max
+            _comp_quarantine_activations = proxy._compression_quarantine_activations
+            _comp_quarantine_skips = proxy._compression_quarantine_skips
         return {
             "anthropic_pre_upstream": {
                 "enabled": proxy.anthropic_pre_upstream_sem is not None,
@@ -2488,6 +2581,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
+                "quarantine_active": _comp_timed_out_in_flight > 0,
+                "timed_out_workers": _comp_timed_out_in_flight,
+                "timed_out_workers_max": _comp_timed_out_in_flight_max,
+                "quarantine_activations_total": _comp_quarantine_activations,
+                "quarantine_skips_total": _comp_quarantine_skips,
                 "source": ("auto" if config.compression_max_workers is None else "explicit"),
             },
             "websocket_sessions": {

@@ -1286,26 +1286,6 @@ class AnthropicHandlerMixin:
                     from headroom.transforms.compression_policy import resolve_policy
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
-                    from headroom.ccr.tool_injection import CCR_TOOL_NAME
-
-                    existing_tool_names = {
-                        tool.get("name") or tool.get("function", {}).get("name")
-                        for tool in (body.get("tools") or [])
-                        if isinstance(tool, dict)
-                    }
-
-                    def should_skip_ccr_request_compression(
-                        current_frozen_message_count: int,
-                    ) -> bool:
-                        if is_token_mode(self.config.mode):
-                            return False
-                        # If the tool is already present, CCR stays reversible even on frozen turns.
-                        return (
-                            self.config.ccr_inject_tool
-                            and current_frozen_message_count > 0
-                            and CCR_TOOL_NAME not in existing_tool_names
-                        )
-
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
@@ -1337,29 +1317,109 @@ class AnthropicHandlerMixin:
                         # Record all tool_results in the verified frozen prefix as stable
                         comp_cache.mark_stable_from_messages(messages, frozen_message_count)
 
-                        skip_ccr_request_compression = should_skip_ccr_request_compression(
-                            frozen_message_count
-                        )
-                        if skip_ccr_request_compression:
-                            logger.info(
-                                f"[{request_id}] CCR: skipping request-side compression "
-                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
+                        # Zone 1: Swap cached compressed versions into working copy
+                        working_messages = comp_cache.apply_cached(messages)
+                        if (
+                            getattr(self, "_background_compression_enabled", False)
+                            and frozen_message_count == 0
+                            and original_tokens >= self._background_compression_min_tokens
+                        ):
+                            accepted = self._background_compressor.enqueue(
+                                session_id,
+                                lambda: self.anthropic_pipeline.apply(
+                                    messages=working_messages,
+                                    model=model,
+                                    model_limit=context_limit,
+                                    context=extract_user_query(working_messages),
+                                    frozen_message_count=frozen_message_count,
+                                    idle_seconds=idle_seconds,
+                                    biases=biases,
+                                    request_id=request_id,
+                                    compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
+                                ),
+                                lambda bg_result: comp_cache.update_from_result(
+                                    messages, bg_result.messages
+                                ),
                             )
-                        if skip_ccr_request_compression:
-                            optimized_messages = messages
-                            _, optimized_tokens = await self._count_tokens_offloaded(
-                                model, optimized_messages
+
+                            # Cold-start fast pass: run everything EXCEPT the
+                            # Kompress ML stage synchronously before forwarding.
+                            # The byte-identical freeze (#1850) locks a session
+                            # to whatever form its cold start put in the provider
+                            # cache; deferring the WHOLE pipeline locks in the raw
+                            # transcript and forfeits the session's savings for
+                            # its lifetime — including sub-second wins like
+                            # read_lifecycle stale-read drops. Only Kompress can
+                            # blow the request budget (#1171), so only Kompress
+                            # stays deferred. Fail-open: on timeout/error the
+                            # request forwards exactly as before this pass
+                            # existed. On timeout the worker can't be cancelled
+                            # (Python can't preempt a running thread), but
+                            # _run_compression_in_executor runs it on the bounded
+                            # compression pool and tracks it via the leaked-thread
+                            # metric, so stragglers are capped and observable
+                            # rather than unbounded. The pass is also bounded by
+                            # routing + statistical crushers (observed seconds even
+                            # on multi-M-token counts).
+                            from headroom.proxy.helpers import (
+                                COLD_START_FAST_PASS_TIMEOUT_SECONDS,
                             )
+
+                            _fast_pass = None
+                            try:
+                                async with stage_timer.measure("compression_first_stage"):
+                                    _fast_pass = await self._run_compression_in_executor(
+                                        lambda: self.anthropic_pipeline.apply(
+                                            messages=working_messages,
+                                            model=model,
+                                            model_limit=context_limit,
+                                            context=extract_user_query(working_messages),
+                                            frozen_message_count=frozen_message_count,
+                                            idle_seconds=idle_seconds,
+                                            biases=biases,
+                                            request_id=request_id,
+                                            compression_policy=compression_policy,
+                                            skip_kompress=True,
+                                            **proxy_pipeline_kwargs(self.config),
+                                        ),
+                                        timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
+                                    )
+                            except Exception as e:
+                                logger.info(
+                                    "[%s] Cold-start fast pass skipped (%s: %s); "
+                                    "deferring full pipeline to background",
+                                    request_id,
+                                    type(e).__name__,
+                                    e,
+                                )
+
+                            if _fast_pass is not None:
+                                comp_cache.update_from_result(messages, _fast_pass.messages)
+                                _fast_pass.transforms_applied = list(
+                                    _fast_pass.transforms_applied
+                                ) + [
+                                    "deferred:kompress_background"
+                                    if accepted
+                                    else "deferred:dropped"
+                                ]
+                                result = _fast_pass
+                            else:
+
+                                class _DeferredCompressionResult:
+                                    messages = working_messages
+                                    transforms_applied = [
+                                        "deferred:background_compression"
+                                        if accepted
+                                        else "deferred:dropped"
+                                    ]
+                                    timing = {}
+                                    waste_signals = None
+
+                                result = _DeferredCompressionResult()
                         else:
-                            # Zone 1: Swap cached compressed versions into working copy
-                            working_messages = comp_cache.apply_cached(messages)
-                            if (
-                                getattr(self, "_background_compression_enabled", False)
-                                and frozen_message_count == 0
-                                and original_tokens >= self._background_compression_min_tokens
-                            ):
-                                accepted = self._background_compressor.enqueue(
-                                    session_id,
+                            async with stage_timer.measure("compression_first_stage"):
+                                result = await self._run_compression_in_executor(
                                     lambda: self.anthropic_pipeline.apply(
                                         messages=working_messages,
                                         model=model,
@@ -1372,168 +1432,57 @@ class AnthropicHandlerMixin:
                                         compression_policy=compression_policy,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
-                                    lambda bg_result: comp_cache.update_from_result(
-                                        messages, bg_result.messages
-                                    ),
-                                )
-
-                                # Cold-start fast pass: run everything EXCEPT the
-                                # Kompress ML stage synchronously before forwarding.
-                                # The byte-identical freeze (#1850) locks a session
-                                # to whatever form its cold start put in the provider
-                                # cache; deferring the WHOLE pipeline locks in the raw
-                                # transcript and forfeits the session's savings for
-                                # its lifetime — including sub-second wins like
-                                # read_lifecycle stale-read drops. Only Kompress can
-                                # blow the request budget (#1171), so only Kompress
-                                # stays deferred. Fail-open: on timeout/error the
-                                # request forwards exactly as before this pass
-                                # existed. On timeout the worker can't be cancelled
-                                # (Python can't preempt a running thread), but
-                                # _run_compression_in_executor runs it on the bounded
-                                # compression pool and tracks it via the leaked-thread
-                                # metric, so stragglers are capped and observable
-                                # rather than unbounded. The pass is also bounded by
-                                # routing + statistical crushers (observed seconds even
-                                # on multi-M-token counts).
-                                from headroom.proxy.helpers import (
-                                    COLD_START_FAST_PASS_TIMEOUT_SECONDS,
-                                )
-
-                                _fast_pass = None
-                                try:
-                                    async with stage_timer.measure("compression_first_stage"):
-                                        _fast_pass = await self._run_compression_in_executor(
-                                            lambda: self.anthropic_pipeline.apply(
-                                                messages=working_messages,
-                                                model=model,
-                                                model_limit=context_limit,
-                                                context=extract_user_query(working_messages),
-                                                frozen_message_count=frozen_message_count,
-                                                idle_seconds=idle_seconds,
-                                                biases=biases,
-                                                request_id=request_id,
-                                                compression_policy=compression_policy,
-                                                skip_kompress=True,
-                                                **proxy_pipeline_kwargs(self.config),
-                                            ),
-                                            timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
-                                        )
-                                except Exception as e:
-                                    logger.info(
-                                        "[%s] Cold-start fast pass skipped (%s: %s); "
-                                        "deferring full pipeline to background",
-                                        request_id,
-                                        type(e).__name__,
-                                        e,
-                                    )
-
-                                if _fast_pass is not None:
-                                    comp_cache.update_from_result(messages, _fast_pass.messages)
-                                    _fast_pass.transforms_applied = list(
-                                        _fast_pass.transforms_applied
-                                    ) + [
-                                        "deferred:kompress_background"
-                                        if accepted
-                                        else "deferred:dropped"
-                                    ]
-                                    result = _fast_pass
-                                else:
-
-                                    class _DeferredCompressionResult:
-                                        messages = working_messages
-                                        transforms_applied = [
-                                            "deferred:background_compression"
-                                            if accepted
-                                            else "deferred:dropped"
-                                        ]
-                                        timing = {}
-                                        waste_signals = None
-
-                                    result = _DeferredCompressionResult()
-                            else:
-                                async with stage_timer.measure("compression_first_stage"):
-                                    result = await self._run_compression_in_executor(
-                                        lambda: self.anthropic_pipeline.apply(
-                                            messages=working_messages,
-                                            model=model,
-                                            model_limit=context_limit,
-                                            context=extract_user_query(working_messages),
-                                            frozen_message_count=frozen_message_count,
-                                            idle_seconds=idle_seconds,
-                                            biases=biases,
-                                            request_id=request_id,
-                                            compression_policy=compression_policy,
-                                            **proxy_pipeline_kwargs(self.config),
-                                        ),
-                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
-                                    )
-
-                            # Cache newly compressed messages (index-aligned diff)
-                            if result.messages != working_messages:
-                                comp_cache.update_from_result(messages, result.messages)
-
-                            # Always use pipeline result — Zone 1 swaps are already applied
-                            optimized_messages = result.messages
-                            transforms_applied = result.transforms_applied
-                            pipeline_timing = result.timing
-                            # Issue #327 / Bug 3: pipeline.apply uses the provider-
-                            # side tokenizer (AnthropicProvider tiktoken estimator),
-                            # which counts ~25% higher than the proxy-side
-                            # EstimatingTokenCounter used to set `original_tokens`
-                            # at line 634. Reusing `result.tokens_after` here
-                            # produced an apples-vs-oranges comparison against
-                            # `original_tokens` in the inflation guard below
-                            # (line ~901): even after a real 12% compression the
-                            # provider-tokenizer figure was higher than the proxy-
-                            # tokenizer baseline, triggering a spurious revert.
-                            # Recount optimized_messages with the proxy tokenizer
-                            # so original_tokens vs optimized_tokens is self-
-                            # consistent. The recount cost (~ms on a 50K-token
-                            # request) is paid once per request and is dwarfed by
-                            # the upstream call latency.
-                            optimized_tokens = tokenizer.count_messages(optimized_messages)
-                    elif not is_cache_mode(self.config.mode):
-                        skip_ccr_request_compression = should_skip_ccr_request_compression(
-                            frozen_message_count
-                        )
-                        if skip_ccr_request_compression:
-                            logger.info(
-                                f"[{request_id}] CCR: skipping request-side compression "
-                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
-                            )
-                        if not skip_ccr_request_compression:
-                            async with stage_timer.measure("compression_first_stage"):
-                                result = await self._run_compression_in_executor(
-                                    lambda: self.anthropic_pipeline.apply(
-                                        messages=messages,
-                                        model=model,
-                                        model_limit=context_limit,
-                                        context=extract_user_query(messages),
-                                        frozen_message_count=frozen_message_count,
-                                        biases=biases,
-                                        request_id=request_id,
-                                        compression_policy=compression_policy,
-                                        **proxy_pipeline_kwargs(self.config),
-                                    ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
 
-                            if result.messages != messages:
-                                optimized_messages = result.messages
-                                transforms_applied = result.transforms_applied
-                                pipeline_timing = result.timing
-                                original_tokens = result.tokens_before
-                                optimized_tokens = result.tokens_after
-                    else:
-                        skip_ccr_request_compression = should_skip_ccr_request_compression(
-                            frozen_message_count
-                        )
-                        if skip_ccr_request_compression:
-                            logger.info(
-                                f"[{request_id}] CCR: skipping request-side compression "
-                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
+                        # Cache newly compressed messages (index-aligned diff)
+                        if result.messages != working_messages:
+                            comp_cache.update_from_result(messages, result.messages)
+
+                        # Always use pipeline result — Zone 1 swaps are already applied
+                        optimized_messages = result.messages
+                        transforms_applied = result.transforms_applied
+                        pipeline_timing = result.timing
+                        # Issue #327 / Bug 3: pipeline.apply uses the provider-
+                        # side tokenizer (AnthropicProvider tiktoken estimator),
+                        # which counts ~25% higher than the proxy-side
+                        # EstimatingTokenCounter used to set `original_tokens`
+                        # at line 634. Reusing `result.tokens_after` here
+                        # produced an apples-vs-oranges comparison against
+                        # `original_tokens` in the inflation guard below
+                        # (line ~901): even after a real 12% compression the
+                        # provider-tokenizer figure was higher than the proxy-
+                        # tokenizer baseline, triggering a spurious revert.
+                        # Recount optimized_messages with the proxy tokenizer
+                        # so original_tokens vs optimized_tokens is self-
+                        # consistent. The recount cost (~ms on a 50K-token
+                        # request) is paid once per request and is dwarfed by
+                        # the upstream call latency.
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                    elif not is_cache_mode(self.config.mode):
+                        async with stage_timer.measure("compression_first_stage"):
+                            result = await self._run_compression_in_executor(
+                                lambda: self.anthropic_pipeline.apply(
+                                    messages=messages,
+                                    model=model,
+                                    model_limit=context_limit,
+                                    context=extract_user_query(messages),
+                                    frozen_message_count=frozen_message_count,
+                                    biases=biases,
+                                    request_id=request_id,
+                                    compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
+                                ),
+                                timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
+
+                        if result.messages != messages:
+                            optimized_messages = result.messages
+                            transforms_applied = result.transforms_applied
+                            pipeline_timing = result.timing
+                            original_tokens = result.tokens_before
+                            optimized_tokens = result.tokens_after
+                    else:
                         previous_original_messages = prefix_tracker.get_last_original_messages()
                         previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
                         delta = self._extract_cache_stable_delta(
@@ -1544,78 +1493,70 @@ class AnthropicHandlerMixin:
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
-                                if skip_ccr_request_compression:
-                                    optimized_messages = messages
-                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
-                                else:
-                                    # Compress the delta, with two cache-mode adjustments:
-                                    #
-                                    # fix-5: strip the client's transient cache_control marker so
-                                    #   the router's per-block "never compress an explicit cache
-                                    #   key" guard (content_router.py:4006) doesn't skip the ONLY
-                                    #   compressible content every turn (route_counts had
-                                    #   cache_control_protected == the whole delta -> 0%). In cache
-                                    #   mode that marker is NOT the real forwarded breakpoint: the
-                                    #   compressed delta is frozen + replayed verbatim next turn and
-                                    #   normalize_message_cache_control (AFTER compression, below)
-                                    #   owns the single forwarded breakpoint. Cache-safety is
-                                    #   enforced post-compression, not by protecting the delta.
-                                    #
-                                    # fix-6: the delta is a lone tool_result whose tool_use (tool
-                                    #   NAME + call args) lives in the frozen prefix. Passing only
-                                    #   the delta to the router leaves tool_name="" so
-                                    #   _bash_search_fold (lossless grep/rg folding, no size floor),
-                                    #   per-tool bias, and relevance-query enrichment all degrade.
-                                    #   Pass the FULL current messages with frozen_message_count =
-                                    #   prefix length: _build_tool_name_map scans ALL messages (the
-                                    #   delta resolves its tool_name from the prefix's tool_use) but
-                                    #   the compression loop only touches indices >= frozen count,
-                                    #   so ONLY the delta is compressed. Splice the compressed delta
-                                    #   onto the byte-stable forwarded prefix.
-                                    from headroom.cache.prefix_tracker import _strip_cache_control
+                                # Compress the delta, with two cache-mode adjustments:
+                                #
+                                # fix-5: strip the client's transient cache_control marker so
+                                #   the router's per-block "never compress an explicit cache
+                                #   key" guard (content_router.py:4006) doesn't skip the ONLY
+                                #   compressible content every turn (route_counts had
+                                #   cache_control_protected == the whole delta -> 0%). In cache
+                                #   mode that marker is NOT the real forwarded breakpoint: the
+                                #   compressed delta is frozen + replayed verbatim next turn and
+                                #   normalize_message_cache_control (AFTER compression, below)
+                                #   owns the single forwarded breakpoint. Cache-safety is
+                                #   enforced post-compression, not by protecting the delta.
+                                #
+                                # fix-6: the delta is a lone tool_result whose tool_use (tool
+                                #   NAME + call args) lives in the frozen prefix. Passing only
+                                #   the delta to the router leaves tool_name="" so
+                                #   _bash_search_fold (lossless grep/rg folding, no size floor),
+                                #   per-tool bias, and relevance-query enrichment all degrade.
+                                #   Pass the FULL current messages with frozen_message_count =
+                                #   prefix length: _build_tool_name_map scans ALL messages (the
+                                #   delta resolves its tool_name from the prefix's tool_use) but
+                                #   the compression loop only touches indices >= frozen count,
+                                #   so ONLY the delta is compressed. Splice the compressed delta
+                                #   onto the byte-stable forwarded prefix.
+                                from headroom.cache.prefix_tracker import _strip_cache_control
 
-                                    # Compression context = the EXACT forwarded (cached) prefix
-                                    # + the stripped delta, with the prefix frozen. Using the
-                                    # forwarded prefix (not the original) keeps _build_tool_name_map
-                                    # AND cross-turn dedup consistent with what is actually cached:
-                                    # dedup can only reference bytes that are truly present in the
-                                    # forwarded context, so no pointer can dangle. The prefix is
-                                    # frozen (never compressed) and we discard the router's copy of
-                                    # it below, so the forwarded prefix stays byte-identical to last
-                                    # turn -> append-only -> no bust.
-                                    prefix_n = len(stable_forwarded_prefix)
-                                    compression_input = list(stable_forwarded_prefix) + list(
-                                        _strip_cache_control(delta_messages)
-                                    )
-                                    result = await self._run_compression_in_executor(
-                                        lambda: self.anthropic_pipeline.apply(
-                                            messages=compression_input,
-                                            model=model,
-                                            model_limit=context_limit,
-                                            context=extract_user_query(compression_input),
-                                            frozen_message_count=prefix_n,
-                                            idle_seconds=idle_seconds,
-                                            biases=biases,
-                                            request_id=request_id,
-                                            compression_policy=compression_policy,
-                                            **proxy_pipeline_kwargs(self.config),
-                                        ),
-                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
-                                    )
-                                    # Only the delta was eligible for compression (prefix frozen);
-                                    # forward the byte-identical cached prefix + the compressed delta.
-                                    compressed_delta = result.messages[prefix_n:]
-                                    optimized_messages = stable_forwarded_prefix + compressed_delta
-                                    transforms_applied = result.transforms_applied
-                                    pipeline_timing = result.timing
-                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                # Compression context = the EXACT forwarded (cached) prefix
+                                # + the stripped delta, with the prefix frozen. Using the
+                                # forwarded prefix (not the original) keeps _build_tool_name_map
+                                # AND cross-turn dedup consistent with what is actually cached:
+                                # dedup can only reference bytes that are truly present in the
+                                # forwarded context, so no pointer can dangle. The prefix is
+                                # frozen (never compressed) and we discard the router's copy of
+                                # it below, so the forwarded prefix stays byte-identical to last
+                                # turn -> append-only -> no bust.
+                                prefix_n = len(stable_forwarded_prefix)
+                                compression_input = list(stable_forwarded_prefix) + list(
+                                    _strip_cache_control(delta_messages)
+                                )
+                                result = await self._run_compression_in_executor(
+                                    lambda: self.anthropic_pipeline.apply(
+                                        messages=compression_input,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(compression_input),
+                                        frozen_message_count=prefix_n,
+                                        idle_seconds=idle_seconds,
+                                        biases=biases,
+                                        request_id=request_id,
+                                        compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
+                                    ),
+                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                )
+                                # Only the delta was eligible for compression (prefix frozen);
+                                # forward the byte-identical cached prefix + the compressed delta.
+                                compressed_delta = result.messages[prefix_n:]
+                                optimized_messages = stable_forwarded_prefix + compressed_delta
+                                transforms_applied = result.transforms_applied
+                                pipeline_timing = result.timing
+                                optimized_tokens = tokenizer.count_messages(optimized_messages)
                             else:
-                                if skip_ccr_request_compression:
-                                    optimized_messages = messages
-                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
-                                else:
-                                    optimized_messages = stable_forwarded_prefix
-                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                optimized_messages = stable_forwarded_prefix
+                                optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
