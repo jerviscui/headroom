@@ -393,6 +393,10 @@
                                 <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
                                 <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
                             </div>
+                            <div class="flex justify-between items-center" x-show="cliFilteringAvailable">
+                                <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (lifetime)'"></span>
+                                <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringLifetime)"></span>
+                            </div>
                             <div class="flex justify-between items-center" x-show="!cliFilteringAvailable">
                                 <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
                                 <span class="font-mono text-sm text-gray-600">not installed</span>

@@ -53,7 +53,6 @@ if TYPE_CHECKING:
 import httpx
 
 try:
-    import uvicorn
     from fastapi import Depends, FastAPI, HTTPException, Request, Response
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -61,6 +60,13 @@ try:
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
+
+try:
+    import uvicorn
+
+    UVICORN_AVAILABLE = True
+except ImportError:
+    UVICORN_AVAILABLE = False
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -5019,6 +5025,10 @@ def run_server(
     """
     if not FASTAPI_AVAILABLE:
         print("ERROR: FastAPI required. Install: pip install fastapi uvicorn httpx")
+        sys.exit(1)
+
+    if not UVICORN_AVAILABLE:
+        print("ERROR: Uvicorn required. Install: pip install uvicorn")
         sys.exit(1)
 
     # Seed the request-time coding-profile toggles (tool-search, dedupe, read
