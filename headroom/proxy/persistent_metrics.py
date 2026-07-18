@@ -18,6 +18,8 @@ MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
+
+
 def utc_now() -> datetime:
     """Return the current UTC time without sub-second noise in persisted state."""
 
@@ -169,9 +171,7 @@ class PersistentMetricsState:
         raw_cost = _dict_or_empty(source.get("cost"))
         for key in ("input_usd", "compression_savings_usd", "cache_savings_usd"):
             result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
-        result["waste_signals"] = self._normalize_waste_signal_map(
-            source.get("waste_signals")
-        )
+        result["waste_signals"] = self._normalize_waste_signal_map(source.get("waste_signals"))
 
         raw_models = _dict_or_empty(source.get("models"))
         raw_tracked = _dict_or_empty(raw_models.get("tracked"))

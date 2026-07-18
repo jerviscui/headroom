@@ -76,9 +76,7 @@ def test_savings_tracker_rewrites_v5_waste_signal_aliases_at_startup(tmp_path):
         json.dumps(
             {
                 "schema_version": 5,
-                "lifetime_metrics": {
-                    "waste_signals": {"json_noise": 10, "other": 7}
-                },
+                "lifetime_metrics": {"waste_signals": {"json_noise": 10, "other": 7}},
             }
         ),
         encoding="utf-8",
