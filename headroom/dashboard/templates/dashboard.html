@@ -1832,12 +1832,13 @@
                 savingsHistory: [],
                 expandedRows: {},
                 pollInterval: null,
-                statsPollMs: 5000,
-                lifetimePollMs: 30000,
-                historyPollMs: 30000,
+                statsPollMs: 15000,
+                viewPollMs: 30000,
                 feedPollMs: 5000,
-                lastLifetimeFetchMs: 0,
-                lastHistoryFetchMs: 0,
+                viewRefreshers: {
+                    lifetime: { lastFetchedAt: 0, fetchMethod: 'fetchLifetimeStats' },
+                    history: { lastFetchedAt: 0, fetchMethod: 'fetchHistoryStats' },
+                },
                 lastFeedFetchMs: 0,
                 feedOpen: false,
                 transformations: [],
@@ -1868,13 +1869,8 @@
 
                     await this.fetchStats();
 
+                    await this.refreshActiveView(force);
                     const now = Date.now();
-                    if (this.viewMode === 'lifetime' && (force || now - this.lastLifetimeFetchMs >= this.lifetimePollMs)) {
-                        await this.fetchLifetimeStats();
-                    }
-                    if (this.viewMode === 'history' && (force || now - this.lastHistoryFetchMs >= this.historyPollMs)) {
-                        await this.fetchHistoryStats();
-                    }
                     if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
                         await this.fetchTransformations();
                     }
@@ -1882,11 +1878,14 @@
 
                 async setViewMode(mode) {
                     this.viewMode = mode;
-                    if (mode === 'lifetime') {
-                        await this.fetchLifetimeStats();
-                    }
-                    if (mode === 'history') {
-                        await this.fetchHistoryStats();
+                    await this.refreshActiveView(true);
+                },
+
+                async refreshActiveView(force = false) {
+                    const refresher = this.viewRefreshers[this.viewMode];
+                    if (!refresher) return;
+                    if (force || Date.now() - refresher.lastFetchedAt >= this.viewPollMs) {
+                        await this[refresher.fetchMethod]();
                     }
                 },
 
@@ -1936,7 +1935,7 @@
                         const response = await fetch('/stats-lifetime');
                         if (response.ok) {
                             this.lifetimeStats = await response.json();
-                            this.lastLifetimeFetchMs = Date.now();
+                            this.viewRefreshers.lifetime.lastFetchedAt = Date.now();
                         }
                     } catch (e) {
                         console.error('Failed to fetch lifetime stats:', e);
@@ -1947,7 +1946,7 @@
                         const response = await fetch('/stats-history');
                         if (response.ok) {
                             this.historyStats = await response.json();
-                            this.lastHistoryFetchMs = Date.now();
+                            this.viewRefreshers.history.lastFetchedAt = Date.now();
                         }
                     } catch (e) {
                         console.error('Failed to fetch history stats:', e);
