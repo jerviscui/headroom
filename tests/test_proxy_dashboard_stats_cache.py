@@ -723,6 +723,9 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     html = get_dashboard_html()
 
     assert "fetch('/stats?cached=1')" in html
+    assert "statsPollMs: 15000" in html
+    assert "viewRefreshers:" in html
+    assert "this.refreshActiveView(force)" in html
     assert "version: 'loading'" in html
     assert 'x-text="formatVersion(version)"' in html
     assert "return /^\\d+\\.\\d+\\.\\d+$/.test(label)" in html
@@ -731,7 +734,7 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "0.3.0" not in html
     assert "@click=\"setViewMode('history')\"" in html
     assert '@click="toggleFeed()"' in html
-    assert "this.viewMode === 'history'" in html
+    assert "this.viewRefreshers[this.viewMode]" in html
     assert "this.feedOpen" in html
     assert "CLI Filtering (rtk)" not in html
     assert "RTK Filtered" not in html
