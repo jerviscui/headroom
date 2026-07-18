@@ -145,6 +145,75 @@ class TestLoopbackGating:
     def test_settings_page_rejected_off_loopback(self, network_client):
         assert network_client.get("/dashboard/settings").status_code == 404
 
+    def test_trusted_dashboard_client_can_use_settings_routes(self, workspace, monkeypatch):
+        from headroom.install import runtime as install_runtime
+
+        monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+        monkeypatch.setattr(
+            install_runtime,
+            "detect_current_deployment",
+            lambda: (None, "foreground"),
+        )
+        monkeypatch.setattr(
+            install_runtime,
+            "restart_current_deployment",
+            lambda: {"restarted": False, "mode": "foreground"},
+        )
+        client = TestClient(
+            _make_app(),
+            base_url="http://100.82.0.2:8787",
+            client=("100.90.0.5", 12345),
+        )
+
+        assert client.get("/dashboard/settings").status_code == 200
+        assert client.get("/settings/schema").status_code == 200
+        assert client.get("/settings").status_code == 200
+        assert client.post("/settings", json={"values": {}}).status_code == 200
+        assert client.post("/settings/apply", json={}).status_code == 200
+
+    def test_untrusted_dashboard_clients_cannot_use_settings_routes(self, workspace, monkeypatch):
+        monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+        app = _make_app()
+        clients = (
+            TestClient(
+                app,
+                base_url="http://100.82.0.2:8787",
+                client=("100.90.0.6", 12345),
+            ),
+            TestClient(
+                app,
+                base_url="http://attacker.example",
+                client=("100.90.0.5", 12345),
+            ),
+        )
+
+        for client in clients:
+            assert client.get("/dashboard/settings").status_code == 404
+            assert client.get("/settings/schema").status_code == 404
+            assert client.post("/settings", json={"values": {}}).status_code == 404
+            assert client.post("/settings/apply", json={}).status_code == 404
+
+    def test_settings_trusts_forwarded_client_only_from_trusted_gateway(
+        self, workspace, monkeypatch
+    ):
+        monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+        monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "172.18.0.0/16")
+        app = _make_app()
+        trusted = TestClient(
+            app,
+            base_url="http://100.82.0.2:8787",
+            client=("172.18.0.1", 12345),
+        )
+        forged = TestClient(
+            app,
+            base_url="http://100.82.0.2:8787",
+            client=("198.51.100.10", 12345),
+        )
+
+        headers = {"x-forwarded-for": "100.90.0.5"}
+        assert trusted.get("/settings/schema", headers=headers).status_code == 200
+        assert forged.get("/settings/schema", headers=headers).status_code == 404
+
 
 class TestSameOriginGuard:
     """CSRF: a same-machine (loopback) attacker page can still send a
