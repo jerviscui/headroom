@@ -473,7 +473,7 @@
                 </div>
 
                 <!-- Prefix Cache Impact: current process only -->
-                <template x-if="cacheSessionActive">
+                <template x-if="hasPrefixCacheImpact">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                         <div class="flex justify-between items-center mb-3">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
@@ -520,6 +520,13 @@
                                 <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
                             </div>
                         </div>
+                        <template x-if="lifetimeCacheReadTokens > 0 || lifetimeCacheSavingsUsd > 0">
+                            <div class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 mb-4">
+                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads (lifetime)</div>
+                                <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(lifetimeCacheReadTokens)"></div>
+                                <div class="text-xs text-emerald-400/70" x-text="'$' + formatCurrency(lifetimeCacheSavingsUsd) + ' saved'"></div>
+                            </div>
+                        </template>
                         <!-- Cache efficiency bar (session-scoped; hidden until traffic arrives) -->
                         <div x-show="cacheSessionActive">
                             <div class="flex justify-between text-xs text-gray-500 mb-1">
@@ -2480,6 +2487,20 @@
 
                 get cacheSessionActive() {
                     return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
+                },
+
+                get lifetimeCacheReadTokens() {
+                    return this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0;
+                },
+
+                get lifetimeCacheSavingsUsd() {
+                    return this.stats.persistent_savings?.lifetime?.cache_savings_usd || 0;
+                },
+
+                get hasPrefixCacheImpact() {
+                    return this.cacheSessionActive
+                        || this.lifetimeCacheReadTokens > 0
+                        || this.lifetimeCacheSavingsUsd > 0;
                 },
 
                 get cacheSavingsPercent() {
